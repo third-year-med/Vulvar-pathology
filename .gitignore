@@ -1,5 +1,7 @@
 node_modules/
-data/
-.env
 *.tmp
 test-output/
+# never commit secrets or private seed files (they contain answer keys)
+.env
+*_seed.json
+*-connected.html

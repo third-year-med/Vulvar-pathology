@@ -1,7 +1,8 @@
-/* Teacher editor — delivered by the server to teacher sessions only (GET /admin/editor.js checks the role).
-   Built on the same principles as the Presentation Mode slide editor: content is plain text with the
-   platform's own light formatting, edited in a panel with live preview, undo, and automatic saving —
-   but saving now goes to a server-side DRAFT that students never see until it is published.
+/* Teacher editor — loaded by boot.js for teacher sessions only. It contains no secrets: every action it
+   performs is a backend call that the Apps Script backend (GynContent.gs / Gyn.gs) authorises with the
+   teacher session. Built on the same principles as the Presentation Mode slide editor: content is plain text
+   with the platform's own light formatting, edited in a panel with live preview, undo, and automatic saving
+   to the DRAFT kept in the private spreadsheet — students never see it until it is published.
 
    Pieces (all generic, reused across Learn, Practice, Review and media):
    - Draft:       state, autosave (debounced), conflict handling, undo/redo, unsaved-changes warnings
@@ -10,10 +11,12 @@
                   tables with a grid editor, callouts, labels, pictures; paste from Word/web keeps formatting)
    - FormEditor:  schema-driven form for records (sections, review items, settings)
    - Blocks:      click any paragraph/list/table/picture in Learn Mode to edit, move, duplicate or delete it
-   - Questions:   structural editor for practice questions, section checks and assessment questions,
-                  with permanent question ids and option ids
-   - Pictures:    picture dialog (replace/upload/library, caption, alt text, size, alignment) + media library
-   - Publishing:  draft status, preview, publish (GitHub on the server), history and rollback */
+   - Questions:   structural editor for section checks (part of the Learn content); practice and assessment
+                  questions live in the backend question bank and open the Teacher portal's editor
+   - Pictures:    picture dialog (replace/upload/library, caption, alt text, size, alignment) + media library;
+                  files are encrypted in this browser and committed to GitHub by the backend
+   - Publishing:  draft status, preview, publish (encrypted, committed to GitHub by the backend), history and
+                  rollback (spreadsheet snapshots and GitHub commits) */
 (function () {
   'use strict';
   window.VULVA_EDITOR = function (A) {
@@ -30,7 +33,7 @@
     var rev = CX.rev || 0, dirty = false, saving = false, saveErr = '', lastSaved = CX.savedAt, saveT = null, undoStack = [], redoStack = [];
     function cleanContent() {
       // D carries a few lookup fields the app adds at run time (section → lecture); they are not content.
-      var c = JSON.parse(JSON.stringify(D));
+      var c = JSON.parse(JSON.stringify(D)); delete c.__published;
       c.lectures.forEach(function (L) { L.sections.forEach(function (s) { delete s.lecture; s.subs.forEach(function (u) { delete u.section; delete u.lecture; }); }); });
       return c;
     }
@@ -61,11 +64,11 @@
       if (saving) { saveT = setTimeout(function () { save(checkpoint); }, 500); return Promise.resolve(false); }
       if (!dirty && !checkpoint) return Promise.resolve(true);
       saving = true; dirty = false; updateBar();
-      return CX.api('PUT', '/api/admin/draft', { content: cleanContent(), baseRev: rev, checkpoint: !!checkpoint }).then(function (r) {
+      return CX.api('vulvaAdminContentSave', { content: cleanContent(), baseRev: rev, checkpoint: !!checkpoint }).then(function (r) {
         saving = false;
-        if (r.ok) { rev = r.rev; lastSaved = r.savedAt; saveErr = ''; updateBar(); return true; }
+        if (r.ok) { rev = r.rev; lastSaved = r.at; saveErr = ''; CX.fromLive = false; updateBar(); return true; }
         dirty = true;
-        if (r.status === 409) { saveErr = 'conflict'; conflict(); }
+        if (r.code === 'conflict') { saveErr = 'conflict'; conflict(); }
         else saveErr = r.error + (r.issues ? ' ' + r.issues.slice(0, 3).join(' · ') : '');
         updateBar(); return false;
       });
@@ -73,7 +76,7 @@
     function conflict() {
       A.modal('The draft was changed elsewhere', '<p>Another tab or another teacher saved the draft after you opened it.</p><p><b>Reload</b> to continue from the latest draft (your last unsaved changes here are lost), or <b>Keep my version</b> to overwrite the draft with what you see now.</p>',
         [{ label: 'Reload', onClick: function () { dirty = false; location.reload(); } }, { label: 'Keep my version', cls: 'primary', onClick: function () {
-          CX.api('GET', '/api/admin/status').then(function (s) { rev = s.draft ? s.draft.rev : 0; dirty = true; save(true); });
+          CX.api('vulvaAdminContentGet').then(function (s) { if (!s.ok) return toast(s.error); rev = s.draft ? s.draft.rev : 0; dirty = true; save(true); });
         } }]);
     }
     window.addEventListener('beforeunload', function (e) { if (dirty || saving || openPanel) { e.preventDefault(); e.returnValue = ''; } });
@@ -82,16 +85,15 @@
     HOOKS.contentChanged = function () { if (!IS_DRAFT) return Promise.reject(new Error('Open the draft to edit slides.')); A.reindex(); markDirty(); return Promise.resolve(); };
     HOOKS.uploadImage = function (dataUrl) {
       if (!IS_DRAFT) return Promise.reject(new Error('Open the draft to add pictures.'));
-      var m = /^data:([^;]+);base64,(.*)$/.exec(dataUrl); if (!m) return Promise.reject(new Error('Could not read the picture.'));
-      var bin = atob(m[2]), u8 = new Uint8Array(bin.length); for (var i = 0; i < bin.length; i++) u8[i] = bin.charCodeAt(i);
-      return CX.api('POST', '/api/admin/media', undefined, { body: new Blob([u8], { type: m[1] }), type: m[1] }).then(function (r) {
-        if (!r.ok) throw new Error(r.error || 'Upload failed.');
-        D.media = D.media || {};
-        if (!D.media[r.file]) D.media[r.file] = { title: '', alt: '', description: '', type: r.type, bytes: r.bytes, uploadedAt: Date.now() };
+      return prepareMedia([dataUrl]).then(function (list) { return putMedia(list); }).then(function (list) {
+        var f = list[0]; D.media = D.media || {};
+        if (!D.media[f.file]) D.media[f.file] = { title: '', alt: '', description: '', type: f.type, bytes: f.bytes, uploadedAt: Date.now() };
         markDirty();
-        return 'media/' + r.file;
+        return 'media/' + f.file;
       });
     };
+    var MT = window.VULVA_MEDIA(CX), prepareMedia = MT.prepare, putMedia = MT.put, b64 = MT.b64;
+    function setImg(img, src) { if (/^media\//.test(src)) { img.removeAttribute('src'); img.setAttribute('data-media', src); } else { img.removeAttribute('data-media'); img.src = src; } }
 
     /* ================= small helpers ================= */
     function rid(p) { return p + Date.now().toString(36).slice(-5) + Math.random().toString(36).slice(2, 6); }
@@ -436,18 +438,16 @@
     function refsTo(ids) {
       var set = {}; ids.forEach(function (i) { set[i] = 1; });
       var n = { practice: 0, checks: 0, questions: 0, review: 0 };
-      D.practice.forEach(function (x) { if (set[x.sub] || set[x.section]) n.practice++; });
+      (idx().PR || []).forEach(function (x) { if (set[x.sub] || set[x.section]) n.practice++; });   // in the question bank: re-link them there
       D.checks.forEach(function (c) { if (set[c.sec]) n.checks++; });
-      D.questions.forEach(function (q) { if ((q.sections || []).some(function (s) { return set[s]; }) || set[q.sub]) n.questions++; });
       ['facts', 'traps', 'comparisons', 'morphology'].forEach(function (k) { (D.review[k] || []).forEach(function (x) { if (set[x.sub]) n.review++; }); });
       return n;
     }
     function remapRefs(ids, toSub, toSec) {
       var set = {}; ids.forEach(function (i) { set[i] = 1; });
       var sec = findSection(toSec), L = sec ? sec.L.num : null;
-      D.practice.forEach(function (x) { if (set[x.sub] || set[x.section]) { x.sub = toSub; x.section = toSec; x.lecture = L; } });
+      void L;
       D.checks.forEach(function (c) { if (set[c.sec]) c.sec = toSub; });
-      D.questions.forEach(function (q) { if ((q.sections || []).some(function (s) { return set[s]; }) || set[q.sub]) { q.sections = [toSub]; q.sub = toSub; q.section = toSec; q.lecture = L; } });
       ['facts', 'traps', 'comparisons', 'morphology'].forEach(function (k) { (D.review[k] || []).forEach(function (x) { if (set[x.sub]) x.sub = toSub; }); });
       Object.keys(D.concepts).forEach(function (k) {
         var c = D.concepts[k];
@@ -456,9 +456,10 @@
       });
       Object.keys(D.topics).forEach(function (k) { var t = D.topics[k]; var had = t.sections.some(function (s) { return set[s]; }); t.sections = t.sections.filter(function (s) { return !set[s]; }); if (had && t.sections.indexOf(toSec) < 0) t.sections.push(toSec); });
     }
+    function pqNote(n) { return n.practice ? ' Note: ' + n.practice + ' practice question(s) in the question bank are linked here — re-link them in Teacher portal → Question bank.' : ''; }
     function refText(n) {
       var parts = [];
-      if (n.practice) parts.push(n.practice + ' practice question(s)'); if (n.checks) parts.push(n.checks + ' section check(s)'); if (n.questions) parts.push(n.questions + ' assessment question(s)'); if (n.review) parts.push(n.review + ' review item(s)');
+      if (n.checks) parts.push(n.checks + ' section check(s)'); if (n.questions) parts.push(n.questions + ' assessment question(s)'); if (n.review) parts.push(n.review + ' review item(s)');
       return parts.join(', ');
     }
 
@@ -538,7 +539,7 @@
       var nb = f.L.sections[f.i - 1] || f.L.sections[f.i + 1];
       if (!nb) D.lectures.some(function (L) { return L !== f.L && L.sections.length && (nb = L.sections[0]); });
       var n = refsTo(ids), rt = refText(n);
-      confirmDel('Delete section ' + A.num(id) + '?', 'Delete “' + f.s.title + '” and its ' + f.s.subs.length + ' learning block(s)?' + (rt ? ' ' + rt + ' linked to it will be re-linked to section ' + A.num(nb.id) + ' “' + nb.title + '”.' : '') + ' You can undo this until you leave the page; nothing reaches students until you publish.', 'Delete section', function () {
+      confirmDel('Delete section ' + A.num(id) + '?', 'Delete “' + f.s.title + '” and its ' + f.s.subs.length + ' learning block(s)?' + (rt ? ' ' + rt + ' linked to it will be re-linked to section ' + A.num(nb.id) + ' “' + nb.title + '”.' : '') + ' You can undo this until you leave the page; nothing reaches students until you publish.' + pqNote(n), 'Delete section', function () {
         change(function () { remapRefs(ids, (nb.subs[0] || nb).id, nb.id); f.L.sections.splice(f.L.sections.indexOf(f.s), 1); });
         if (openPanel) openPanel.close(true);
       });
@@ -583,7 +584,7 @@
     function deleteSub(id) {
       var f = findSub(id), nb = f.s.subs[f.i - 1] || f.s.subs[f.i + 1];
       var to = nb ? nb.id : f.s.id, n = refsTo([id]), rt = refText(n);
-      confirmDel('Delete block ' + A.num(id) + '?', 'Delete the learning block “' + f.u.title + '”?' + (rt ? ' ' + rt + ' linked to it will move to ' + (nb ? 'block ' + A.num(nb.id) + ' “' + nb.title + '”' : 'section ' + A.num(f.s.id)) + '.' : '') + ' Undo is available until you leave the page.', 'Delete block', function () {
+      confirmDel('Delete block ' + A.num(id) + '?', 'Delete the learning block “' + f.u.title + '”?' + (rt ? ' ' + rt + ' linked to it will move to ' + (nb ? 'block ' + A.num(nb.id) + ' “' + nb.title + '”' : 'section ' + A.num(f.s.id)) + '.' : '') + ' Undo is available until you leave the page.' + pqNote(n), 'Delete block', function () {
         change(function () { remapRefs([id], to, f.s.id); f.s.subs.splice(f.s.subs.indexOf(f.u), 1); });
         if (openPanel) openPanel.close(true);
       });
@@ -723,7 +724,26 @@
     }
 
     /* ================= Questions ================= */
-    var BANKS = { practice: 'Practice question', checks: 'Section check', questions: 'Assessment question' };
+    // Section checks are part of the Learn content (this draft). Practice and assessment questions live in the
+    // backend question bank (versioned; answers never published) and are edited through the Teacher portal.
+    var BANKS = { checks: 'Section check' };
+    var BANK = null;   // cached vulvaAdminBank reply
+    function getBank(force) {
+      if (BANK && !force) return Promise.resolve(BANK);
+      return CX.api('vulvaAdminBank').then(function (r) { if (!r.ok) throw new Error(r.error || 'The question bank could not be loaded.'); BANK = r.questions; return BANK; });
+    }
+    HOOKS.bankChanged = function () { BANK = null; };
+    HOOKS.questionImages = function () {
+      return (BANK || []).filter(function (q) { return q.image; }).map(function (q) { return { group: q.kind === 'assess' ? 'Assessment questions' : 'Practice questions', where: q.qid, desc: q.image }; });
+    };
+    function serverQuestion(qid, mode) {
+      getBank().then(function (list) { var x = list.filter(function (q) { return q.qid === qid; })[0]; if (!x) return toast('Question ' + qid + ' was not found in the bank.'); A.editServerQuestion(x, mode); }, function (e) { toast(e.message); });
+    }
+    function newServerQuestion(kind, place) {
+      var pi = placeInfo(place || A.index().ORDER[0]), topic = A.index().SEC_TOPIC[pi.section] || Object.keys(D.topics)[0];
+      var concept = (Object.keys(D.concepts).filter(function (k) { return (D.concepts[k].subs || []).indexOf(pi.sub) >= 0; })[0]) || '';
+      A.editServerQuestion({ kind: kind, lecture: 'L' + (pi.lecture || 1), section: pi.section, sub: pi.sub, topic: topic, concept: concept, objective: '', difficulty: 'Application', priority: 2, label: 'COURSE CORE', previousExam: false, integrated: false, image: '', stem: '', options: ['', '', '', ''], answer: 0, explanation: '', trap: '', ref: '' }, 'new');
+    }
     var DIFF = [['Basic', 'Basic'], ['Intermediate', 'Intermediate'], ['Advanced', 'Advanced']];
     function bankArr(b) { return D[b]; }
     function findQ(id) { var r = null; Object.keys(BANKS).forEach(function (b) { D[b].forEach(function (x, i) { if (x.id === id) r = { bank: b, arr: D[b], i: i, x: x }; }); }); return r; }
@@ -742,8 +762,8 @@
     }
     function addQuestionMenu(place) {
       var m = A.modal('Add a question', '<p>Which kind of question?</p>', [{ label: 'Cancel' }]);
-      var box = h('<div class="ed-col"><button class="btn" type="button" data-b="practice">🧠 Practice question <span class="small muted">(Test yourself + Practice; single best answer)</span></button><button class="btn" type="button" data-b="checks">🧩 Section check <span class="small muted">(Pathology Challenge; true/false, fill-in, matching, sorting, select-all, single best answer)</span></button><button class="btn" type="button" data-b="questions">📝 Assessment question <span class="small muted">(graded paper)</span></button></div>');
-      box.onclick = function (e) { var b = e.target.closest('[data-b]'); if (!b) return; m.close(); questionEditor(template(b.dataset.b, place), b.dataset.b, true); };
+      var box = h('<div class="ed-col"><button class="btn" type="button" data-b="practice">🧠 Practice question <span class="small muted">(Test yourself + Practice; single best answer; saved in the question bank)</span></button><button class="btn" type="button" data-b="checks">🧩 Section check <span class="small muted">(Pathology Challenge; true/false, fill-in, matching, sorting, select-all, single best answer)</span></button><button class="btn" type="button" data-b="assess">📝 Assessment question <span class="small muted">(graded papers; saved in the question bank)</span></button></div>');
+      box.onclick = function (e) { var b = e.target.closest('[data-b]'); if (!b) return; m.close(); if (b.dataset.b === 'checks') questionEditor(template('checks', place), 'checks', true); else newServerQuestion(b.dataset.b, place); };
       $('.mbody', m.el).appendChild(box);
     }
 
@@ -1002,11 +1022,22 @@
       };
       return t;
     }
+    function serverToolbar(qid) {
+      var t = h('<div class="ed-row ed-qbar noprint"><button class="btn small" type="button" data-a="e">✏️ Edit question</button><button class="btn small" type="button" data-a="d">⧉ Duplicate</button><button class="btn small danger" type="button" data-a="x">Deactivate</button><span class="small muted">question bank · ' + esc(qid) + '</span></div>');
+      t.onclick = function (e) {
+        var a = e.target.dataset.a; if (!a) return; e.stopPropagation();
+        if (a === 'e') serverQuestion(qid, 'edit'); if (a === 'd') serverQuestion(qid, 'duplicate');
+        if (a === 'x') confirmDel('Deactivate ' + qid + '?', 'Students stop seeing it in practice at once (it stays in the bank with its history and can be activated again in Teacher portal → Question bank).', 'Deactivate', function () {
+          CX.api('vulvaAdminSetActive', { qid: qid, active: false }).then(function (r) { if (!r.ok) return toast(r.error); BANK = null; toast(qid + ' deactivated.'); A.refreshServer(true).then(rerender); });
+        });
+      };
+      return t;
+    }
     function decorateQuestions(root) {
       $$('[data-qid]', root).forEach(function (el) {
         if (el.querySelector(':scope > .ed-qbar') || el.closest('.qbank')) return;
-        if (!findQ(el.dataset.qid)) return;
-        el.insertBefore(qToolbar(el.dataset.qid), el.firstChild);
+        if (findQ(el.dataset.qid)) el.insertBefore(qToolbar(el.dataset.qid), el.firstChild);
+        else if (el.dataset.bank === 'practice') el.insertBefore(serverToolbar(el.dataset.qid), el.firstChild);
       });
       // "Test yourself" boxes render their questions on first open — decorate them then.
       $$('details.ty', root).forEach(function (d) {
@@ -1017,11 +1048,11 @@
 
     /* ---- Question banks page ---- */
     function viewQuestionBanks(bank) {
-      var app = A.app(); bank = BANKS[bank] ? bank : 'practice';
+      var app = A.app(); bank = 'checks';
       app.appendChild(h('<p class="small noprint"><a href="#/faculty">← Faculty tools</a></p>'));
-      app.appendChild(h('<div class="row"><h1>Question banks</h1><div class="spacer"></div>' + (IS_DRAFT ? '<button class="btn primary qb-add" type="button">＋ Add question</button>' : '') + '</div>'));
+      app.appendChild(h('<div class="row"><h1>Section checks</h1><div class="spacer"></div>' + (IS_DRAFT ? '<button class="btn primary qb-add" type="button">＋ Add section check</button>' : '') + '</div>'));
       if (!IS_DRAFT) app.appendChild(liveNotice());
-      app.appendChild(h('<div class="tabs" role="tablist">' + Object.keys(BANKS).map(function (b) { return '<a class="btn' + (b === bank ? ' navy' : '') + '" href="#/faculty/questions/' + b + '">' + BANKS[b] + 's (' + D[b].length + ')</a>'; }).join(' ') + '</div>'));
+      app.appendChild(h('<div class="tabs" role="tablist"><a class="btn navy" href="#/faculty/questions/checks">Section checks (' + D.checks.length + ')</a> <a class="btn" href="#/teacher/bank">Practice & assessment questions → Question bank</a></div>'));
       var ctl = h('<div class="card row qbank-ctl"><div class="field" style="margin:0;flex:1;min-width:200px"><label>Learning block</label><select class="qb-f"><option value="">All</option>' + placeOptions('', true, true) + '</select></div><div class="field" style="margin:0;flex:1;min-width:180px"><label>Search</label><input class="qb-s" type="search" placeholder="Words in the question, or its code…"></div></div>');
       app.appendChild(ctl);
       if (bank === 'questions') app.appendChild(h('<p class="small muted">This is the order of the graded paper. New attempts use this order; saved results keep the questions they had.</p>'));
@@ -1049,6 +1080,8 @@
     }
 
     /* ================= Pictures & media library ================= */
+    HOOKS.pictureDialog = function (desc, opts) { return pictureDialog(desc, Object.assign({ stack: !!openPanel }, opts || {})); };
+    getBank().catch(function () {});   // question pictures for the picture library
     HOOKS.figTools = function (key, p) { return '<div class="pic-tools noprint"><button class="btn pic-edit" type="button">🖼 ' + (p ? 'Edit / replace picture' : 'Add picture') + '</button><span class="small muted">or drop / paste a picture here</span></div>'; };
     function slotUsage(key) { var s = A.allPicSlots().filter(function (x) { return x.key === key; })[0]; return s ? s.where : []; }
     function fileUsage() {
@@ -1059,11 +1092,18 @@
       Object.keys(D.decks || {}).forEach(function (n) { (D.decks[n].slides || []).forEach(function (s, i) { (s.images || []).forEach(function (im) { add(im.src, 'Lecture ' + n + ' slide ' + (i + 1)); }); }); });
       return use;
     }
+    function libraryFiles() {
+      var seen = {}, out = [];
+      function add(f) { if (f && !seen[f]) { seen[f] = 1; var m = (D.media || {})[f] || {}; out.push({ file: f, bytes: m.bytes || 0, uploadedAt: m.uploadedAt || 0 }); } }
+      Object.keys(D.media || {}).forEach(add);
+      Object.keys(fileUsage()).forEach(add);
+      return out.sort(function (a, b) { return (b.uploadedAt || 0) - (a.uploadedAt || 0); });
+    }
     function pickFromLibrary(cb) {
       var m = A.modal('Choose a picture from the library', '<p class="small muted">Loading…</p>', [{ label: 'Cancel' }]);
       m.el.querySelector('.modal').classList.add('wide');
-      CX.api('GET', '/api/admin/media').then(function (r) {
-        var b = $('.mbody', m.el); if (!r.ok) { b.innerHTML = '<p class="err">' + esc(r.error) + '</p>'; return; }
+      Promise.resolve({ ok: true, files: libraryFiles() }).then(function (r) {
+        var b = $('.mbody', m.el);
         var use = fileUsage();
         b.innerHTML = '<input type="search" class="lib-q" placeholder="Filter by title or caption…" style="width:100%;margin-bottom:10px"><div class="libgrid"></div>';
         function draw() {
@@ -1072,7 +1112,7 @@
             var meta = (D.media || {})[f.file] || {}, label = meta.title || (use[f.file] || [])[0] || f.file;
             if (q && (label + ' ' + (meta.description || '')).toLowerCase().indexOf(q) < 0) return;
             var c = h('<button type="button" class="libcard"><img alt="" loading="lazy"><span class="small">' + esc(label) + '</span></button>');
-            $('img', c).src = 'media/' + f.file;
+            setImg($('img', c), 'media/' + f.file);
             c.onclick = function () { m.close(); cb('media/' + f.file, meta); };
             g.appendChild(c);
           });
@@ -1110,7 +1150,7 @@
       function drawPrev() {
         v('.pd-wv').textContent = v('.pd-al').value === 'full' ? 'full width' : v('.pd-w').value + '%';
         var pv = v('.picprev');
-        if (p.src && !removed) { pv.innerHTML = '<img alt="Preview">'; $('img', pv).src = p.src; $('img', pv).style.width = v('.pd-al').value === 'full' ? '100%' : v('.pd-w').value + '%'; }
+        if (p.src && !removed) { pv.innerHTML = '<img alt="Preview">'; setImg($('img', pv), p.src); $('img', pv).style.width = v('.pd-al').value === 'full' ? '100%' : v('.pd-w').value + '%'; }
         else pv.innerHTML = '<div class="muted">No picture yet — upload one or choose from the library.</div>';
         v('.pd-rm').disabled = !p.src || removed;
       }
@@ -1199,23 +1239,21 @@
       var grid = h('<div class="libgrid big"><p class="muted">Loading…</p></div>');
       body.appendChild(top); body.appendChild(grid);
       function load() {
-        CX.api('GET', '/api/admin/media').then(function (r) {
-          if (!r.ok) { grid.innerHTML = '<p class="err">' + esc(r.error) + '</p>'; return; }
+        Promise.resolve({ ok: true, files: libraryFiles() }).then(function (r) {
           var use = fileUsage(); grid.innerHTML = '';
           $('.lib-n', top).textContent = r.files.length + ' file(s) · ' + Math.round(r.files.reduce(function (n, f) { return n + f.bytes; }, 0) / 1048576 * 10) / 10 + ' MB';
           r.files.forEach(function (f) {
             var meta = (D.media || {})[f.file] || {}, u = use[f.file] || [];
-            var c = h('<div class="card libitem"><img alt="" loading="lazy"><div class="small"><b>' + esc(meta.title || (u[0] || 'Untitled picture')) + '</b></div><div class="small muted">' + Math.round(f.bytes / 1024) + ' KB · ' + (u.length ? 'used in ' + u.length + ' place(s)' : 'not used') + (f.published ? '' : ' · <span class="pill warn">not published yet</span>') + '</div>' +
+            var c = h('<div class="card libitem"><img alt="" loading="lazy"><div class="small"><b>' + esc(meta.title || (u[0] || 'Untitled picture')) + '</b></div><div class="small muted">' + Math.round(f.bytes / 1024) + ' KB · ' + (u.length ? 'used in ' + u.length + ' place(s)' : 'not used') + '' + '</div>' +
               (u.length ? '<details class="small"><summary>Where</summary>' + u.map(esc).join('<br>') + '</details>' : '') +
               (IS_DRAFT ? '<div class="ed-row"><button class="btn small li-ed" type="button">✏️ Details</button>' + (u.length ? '' : '<button class="btn small danger li-rm" type="button">Remove from library</button>') + '</div>' : '') + '</div>');
-            $('img', c).src = 'media/' + f.file; $('img', c).onclick = function () { A.lightbox('media/' + f.file, meta.title || ''); };
+            setImg($('img', c), 'media/' + f.file); $('img', c).onclick = function (e) { A.lightbox(e.target.src, meta.title || ''); };
             var ed = $('.li-ed', c); if (ed) ed.onclick = function () {
               formEditor('Library picture details', [{ k: 'title', label: 'Title' }, { k: 'alt', label: 'Default alternative text' }, { k: 'description', label: 'Description / notes', type: 'textarea' }], meta, function (v2) {
                 change(function () { D.media = D.media || {}; D.media[f.file] = Object.assign({}, D.media[f.file] || { uploadedAt: Date.now() }, v2); }, { noRender: true }); load();
               });
             };
-            var rm = $('.li-rm', c); if (rm) rm.onclick = function () { confirmDel('Remove from library?', 'This picture is not used anywhere. Remove it from the library list? (Earlier published versions keep their copy in the Git history.)', 'Remove', function () { change(function () { if (D.media) delete D.media[f.file]; }, { noRender: true }); c.remove(); }); };
-            if (!meta.title && !u.length && !(D.media || {})[f.file] && f.published === false) c.classList.add('orphan');
+            var rm = $('.li-rm', c); if (rm) rm.onclick = function () { confirmDel('Remove from library?', 'This picture is not used anywhere. Remove it from the library list? (The encrypted file stays in the repository, so earlier versions keep working.)', 'Remove', function () { change(function () { if (D.media) delete D.media[f.file]; }, { noRender: true }); c.remove(); }); };
             grid.appendChild(c);
           });
           if (!r.files.length) grid.innerHTML = '<p class="muted">The library is empty.</p>';
@@ -1270,37 +1308,58 @@
       $('button', n).onclick = function () { CX.setView('draft'); };
       return n;
     }
+    /* What changed between two versions of the content (by stable ids), for the publish summary. */
+    function diffContent(a, b) {
+      function blocks(c) { var m = {}; (c.lectures || []).forEach(function (L) { L.sections.forEach(function (s) { m['s:' + s.id] = JSON.stringify([s.title, s.intro, s.label]); s.subs.forEach(function (u) { m[u.id] = JSON.stringify(u); }); }); }); return m; }
+      function byId(list) { var m = {}; (list || []).forEach(function (x, i) { m[x.id || i] = JSON.stringify(x); }); return m; }
+      function keyed(o) { var m = {}; Object.keys(o || {}).forEach(function (k) { m[k] = JSON.stringify(o[k]); }); return m; }
+      function cmp(area, x, y) { var r = { area: area, added: 0, changed: 0, removed: 0 }; Object.keys(y).forEach(function (k) { if (!(k in x)) r.added++; else if (x[k] !== y[k]) r.changed++; }); Object.keys(x).forEach(function (k) { if (!(k in y)) r.removed++; }); return r; }
+      var rv = function (c, k) { return byId(((c.review || {})[k]) || []); };
+      return [cmp('Lecture sections & learning blocks', blocks(a), blocks(b)), cmp('Section checks', byId(a.checks), byId(b.checks)),
+        cmp('Key facts', rv(a, 'facts'), rv(b, 'facts')), cmp('Comparisons', rv(a, 'comparisons'), rv(b, 'comparisons')), cmp('Morphology', rv(a, 'morphology'), rv(b, 'morphology')), cmp('Exam traps', rv(a, 'traps'), rv(b, 'traps')), cmp('15-minute review', rv(a, 'review15'), rv(b, 'review15')),
+        cmp('Pictures', keyed(a.pics), keyed(b.pics)), cmp('Slides', keyed(a.decks), keyed(b.decks)), cmp('Concepts & topics', keyed(Object.assign({}, a.concepts, a.topics)), keyed(Object.assign({}, b.concepts, b.topics))), cmp('Course settings', keyed(a.meta), keyed(b.meta))]
+        .filter(function (r) { return r.added || r.changed || r.removed; });
+    }
+    /* The same structural checks as the backend, so problems are shown before anything is sent. */
+    function checkContent(c) {
+      var errs = [], warns = [], MEDIA = /^media\/[a-f0-9]{32}\.(jpg|png|gif|webp)$/;
+      Object.keys(c.pics || {}).forEach(function (k) { var p = c.pics[k]; if (p && !MEDIA.test(String(p.src || ''))) errs.push('A picture (' + (p.caption || k) + ') is not in the media library yet — open it and upload it again.'); });
+      Object.keys(c.decks || {}).forEach(function (n) { ((c.decks[n] || {}).slides || []).forEach(function (sl, i) { (sl.images || []).forEach(function (im) { if (!MEDIA.test(String(im.src || ''))) errs.push('Lecture ' + n + ', slide ' + (i + 1) + ': a picture is not in the media library yet.'); }); }); });
+      var ids = {}; c.lectures.forEach(function (L) { L.sections.forEach(function (s) { ids[s.id] = 1; s.subs.forEach(function (u) { ids[u.id] = 1; if (!u.md.trim()) warns.push('Block ' + u.id + ' “' + u.title + '” is empty.'); }); }); });
+      c.checks.forEach(function (k) { if (!ids[k.sec]) errs.push('Section check ' + k.id + ' points to a section that no longer exists.'); if (!k.expl) warns.push('Section check ' + k.id + ' has no explanation.'); });
+      return { errors: errs, warnings: warns };
+    }
     function publishDialog() {
       if (!IS_DRAFT) return A.modal('Publish', '<p>Open the draft to review and publish changes.</p>', [{ label: 'Cancel' }, { label: 'Open the draft', cls: 'primary', onClick: function () { CX.setView('draft'); } }]);
       var m = A.modal('Review & publish', '<p class="muted">⏳ Saving the draft and checking it…</p>', [{ label: 'Close' }]);
       m.el.querySelector('.modal').classList.add('wide');
+      var b = $('.mbody', m.el);
       save(true).then(function (ok) {
-        var b = $('.mbody', m.el);
         if (!ok) { b.innerHTML = '<p class="err">The draft could not be saved, so it cannot be published yet. ' + esc(saveErr) + '</p>'; return; }
-        return CX.api('GET', '/api/admin/preview').then(function (r) {
-          if (!r.ok) { b.innerHTML = '<p class="err">' + esc(r.error) + '</p>'; return; }
-          if (!r.hasDraft) { b.innerHTML = '<p>There is nothing to publish: the draft is the same as the live version.</p>'; return; }
-          var ch = r.diff.changes;
-          b.innerHTML = '<p>Students will see these changes after you publish:</p>' +
-            (ch.length ? '<div class="tablewrap"><table class="data"><thead><tr><th>Area</th><th>Added</th><th>Changed</th><th>Removed</th></tr></thead><tbody>' + ch.map(function (c) { return '<tr><td>' + esc(c.area) + '</td><td>' + c.added + '</td><td>' + c.changed + '</td><td>' + c.removed + '</td></tr>'; }).join('') + '</tbody></table></div>' : '<p class="muted">No visible differences found.</p>') +
-            (r.diff.removedGradedQuestions.length ? '<p class="note">⚠ ' + r.diff.removedGradedQuestions.length + ' assessment question(s) were deleted permanently. Students\' past results will no longer list them (consider “Retire” instead).</p>' : '') +
-            (r.outdatedBase ? '<p class="note">⚠ The live version changed after this draft was started (another teacher may have published). Publishing replaces the live version with this draft.</p>' : '') +
-            (r.errors.length ? '<div class="co trap"><p><b>Fix these before publishing:</b></p><ul>' + r.errors.slice(0, 30).map(function (e) { return '<li>' + esc(e) + '</li>'; }).join('') + '</ul></div>' : '') +
-            (r.warnings.length ? '<details class="small"><summary>' + r.warnings.length + ' note(s) — publishing is still possible</summary><ul>' + r.warnings.slice(0, 50).map(function (e) { return '<li>' + esc(e) + '</li>'; }).join('') + '</ul></details>' : '') +
-            '<p class="small">' + (r.github ? '📦 Publishing also saves this version to GitHub as a commit (with history you can return to).' : '⚠ GitHub publishing is not configured on the server: publishing updates this server only. Ask your administrator to set it up so every version is kept safely.') + '</p>' +
-            (r.errors.length ? '' : field('Short description of the changes (saved in the history)', '<input class="pub-msg" maxlength="200" placeholder="e.g. Updated VIN classification and added 3 practice questions">') +
+        if (CX.fromLive && !rev) { b.innerHTML = '<p>There is nothing to publish: you have not changed anything since the last published version.</p>'; return; }
+        return Promise.all([CX.loadPublished().catch(function () { return null; }), CX.api('vulvaAdminContentGet')]).then(function (res) {
+          var live = res[0], st = res[1], cur = cleanContent(), chk = checkContent(cur);
+          if (!st.ok) { b.innerHTML = '<p class="err">' + esc(st.error) + '</p>'; return; }
+          var ch = live ? diffContent(live, cur) : null;
+          b.innerHTML = (ch ? '<p>Students will see these changes after you publish:</p>' + (ch.length ? '<div class="tablewrap"><table class="data"><thead><tr><th>Area</th><th>Added</th><th>Changed</th><th>Removed</th></tr></thead><tbody>' + ch.map(function (c) { return '<tr><td>' + esc(c.area) + '</td><td>' + c.added + '</td><td>' + c.changed + '</td><td>' + c.removed + '</td></tr>'; }).join('') + '</tbody></table></div>' : '<p class="muted">No differences from the published version.</p>') : '<p>This will be the <b>first</b> published version of the course.</p>') +
+            (chk.errors.length ? '<div class="co trap"><p><b>Fix these before publishing:</b></p><ul>' + chk.errors.slice(0, 30).map(function (e) { return '<li>' + esc(e) + '</li>'; }).join('') + '</ul></div>' : '') +
+            (chk.warnings.length ? '<details class="small"><summary>' + chk.warnings.length + ' note(s) — publishing is still possible</summary><ul>' + chk.warnings.slice(0, 50).map(function (e) { return '<li>' + esc(e) + '</li>'; }).join('') + '</ul></details>' : '') +
+            (!st.github.configured ? '<p class="err">Publishing needs the GitHub settings in your Apps Script project (Script Properties GITHUB_TOKEN and GITHUB_REPO). See SETUP.md, step 4.</p>' : '<p class="small">🔒 The course is encrypted in this browser, then the platform commits it to <b>' + esc(st.github.repo) + '</b> (branch ' + esc(st.github.branch) + '). Every published version is kept in the history.</p>') +
+            (chk.errors.length || !st.github.configured ? '' : field('Short description of the changes (saved in the history)', '<input class="pub-msg" maxlength="200" placeholder="e.g. Updated VIN classification and added 3 section checks">') +
               '<label class="chk"><input type="checkbox" class="pub-ok"> I have previewed the draft and want students to see it now.</label><p class="err pub-err"></p>' +
               '<div class="row" style="justify-content:flex-end;margin-top:10px"><button class="btn pub-prev" type="button">👁 Preview first</button><button class="btn primary pub-go" type="button">🚀 Publish now</button></div>');
           var pv = $('.pub-prev', b); if (pv) pv.onclick = function () { m.close(); setPreview(true); };
           var go = $('.pub-go', b);
           if (go) go.onclick = function () {
             if (!$('.pub-ok', b).checked) { $('.pub-err', b).textContent = 'Please confirm that you have previewed the draft.'; return; }
-            go.disabled = true; go.textContent = 'Publishing…';
-            CX.api('POST', '/api/admin/publish', { message: $('.pub-msg', b).value, rev: rev }).then(function (x) {
+            go.disabled = true; go.textContent = 'Encrypting & publishing…';
+            CX.encrypt(new TextEncoder().encode(JSON.stringify(cur))).then(function (enc) {
+              return CX.api('vulvaAdminPublish', { rev: rev, encrypted: b64(enc), message: $('.pub-msg', b).value });
+            }).then(function (x) {
               if (!x.ok) { go.disabled = false; go.textContent = '🚀 Publish now'; $('.pub-err', b).textContent = x.error + (x.issues ? ' ' + x.issues.slice(0, 5).join(' · ') : ''); return; }
               rev = 0; dirty = false; lastSaved = null; CX.fromLive = true; undoStack = []; redoStack = []; updateBar();
-              b.innerHTML = '<p class="good"><b>✓ Published.</b> Students now see the new version (they get it the next time they open or reload the platform).</p>' + (x.publish.url ? '<p>Saved to GitHub: <a href="' + esc(x.publish.url) + '" target="_blank" rel="noopener">commit ' + esc(x.publish.commit.slice(0, 7)) + '</a></p>' : '');
-            });
+              b.innerHTML = '<p class="good"><b>✓ Published.</b> Students get the new version the next time they open or reload the platform (GitHub Pages usually updates within a minute or two).</p>' + (x.url ? '<p>Saved to GitHub: <a href="' + esc(x.url) + '" target="_blank" rel="noopener">commit ' + esc(String(x.commit).slice(0, 7)) + '</a></p>' : '');
+            }, function (e) { go.disabled = false; go.textContent = '🚀 Publish now'; $('.pub-err', b).textContent = e.message || String(e); });
           };
         });
       });
@@ -1309,51 +1368,57 @@
       var app = A.app();
       app.appendChild(h('<p class="small noprint"><a href="#/faculty">← Faculty tools</a></p>'));
       app.appendChild(h('<h1>✏️ Content & publishing</h1>'));
-      app.appendChild(h('<div class="card"><h2 style="margin-top:0">How it works</h2><ol class="steps"><li><b>Edit</b> — turn on <b>✏️ Edit mode</b> in the bar at the top, then click any text, picture or question. Your changes are saved automatically to the <b>draft</b>.</li><li><b>Preview</b> — 👁 Preview shows the draft exactly as students will see it.</li><li><b>Publish</b> — 🚀 Publish makes the draft the live version for students' + ' and saves it to GitHub.</li></ol><p class="small muted">Students never see the draft. Every published version is kept, so you can return to an earlier one.</p></div>'));
+      app.appendChild(h('<div class="card"><h2 style="margin-top:0">How it works</h2><ol class="steps"><li><b>Edit</b> — turn on <b>✏️ Edit mode</b> in the bar at the top, then click any text, picture or question. Changes are saved automatically to the <b>draft</b> (kept in your private spreadsheet).</li><li><b>Preview</b> — 👁 Preview shows the draft exactly as students will see it.</li><li><b>Publish</b> — 🚀 Publish encrypts the draft in your browser and the platform commits it to GitHub; GitHub Pages then serves it to students.</li></ol><p class="small muted">Students never see the draft. Practice and assessment questions are not part of this content: they stay in the question bank on the platform (Teacher portal), so answers are never published.</p></div>'));
       var st = h('<div class="card" style="margin-top:14px"><h2 style="margin-top:0">Status</h2><div class="st-body muted">Loading…</div></div>');
       app.appendChild(st);
-      var acts = h('<div class="row" style="margin:14px 0">' + (IS_DRAFT ? '<button class="btn" type="button" data-a="edit">' + (editing ? '✓ Edit mode is on' : '✏️ Turn on Edit mode') + '</button><button class="btn" type="button" data-a="prev">👁 Preview as student</button><button class="btn primary" type="button" data-a="pub">🚀 Review & publish…</button><button class="btn danger" type="button" data-a="discard">Discard the draft…</button>' : '<button class="btn primary" type="button" data-a="draft">✏️ Open the draft</button>') + '<button class="btn" type="button" data-a="settings">⚙️ Course settings</button></div>');
+      var acts = h('<div class="row" style="margin:14px 0">' + (IS_DRAFT ? '<button class="btn" type="button" data-a="edit">' + (editing ? '✓ Edit mode is on' : '✏️ Turn on Edit mode') + '</button><button class="btn" type="button" data-a="prev">👁 Preview as student</button><button class="btn primary" type="button" data-a="pub">🚀 Review & publish…</button><button class="btn danger" type="button" data-a="discard">Discard the draft…</button>' : '<button class="btn primary" type="button" data-a="draft">✏️ Open the draft</button>') + '<button class="btn" type="button" data-a="settings">⚙️ Course settings</button>' + (IS_DRAFT ? '<button class="btn" type="button" data-a="import">⬆ Import course from a file…</button>' : '') + '</div>');
       acts.onclick = function (e) {
         var a = e.target.dataset.a;
         if (a === 'edit') { setEditing(true); location.hash = '#/learn'; } if (a === 'prev') setPreview(true); if (a === 'pub') publishDialog(); if (a === 'draft') CX.setView('draft'); if (a === 'settings') courseSettings();
-        if (a === 'discard') confirmDel('Discard the draft?', 'Throw away every change that has not been published and go back to the live version? A copy of the draft is kept in the history, so you can restore it later.', 'Discard draft', function () {
+        if (a === 'import') window.VULVA_IMPORT(CX, function (content) { snapshot(); replaceD(JSON.stringify(content)); changed(true); save(true).then(function (ok) { if (ok) toast('Imported into the draft. Preview it, then publish.'); }); });
+        if (a === 'discard') confirmDel('Discard the draft?', 'Throw away every change that has not been published and go back to the published version? A copy of the draft is kept in the history, so you can restore it later.', 'Discard draft', function () {
           clearTimeout(saveT); dirty = false;
-          CX.api('DELETE', '/api/admin/draft').then(function (r) { if (r.ok) { toast('Draft discarded.'); location.reload(); } else toast(r.error); });
+          CX.api('vulvaAdminContentDiscard').then(function (r) { if (r.ok) { toast('Draft discarded.'); location.reload(); } else toast(r.error); });
         });
       };
       app.appendChild(acts);
-      var hist = h('<div class="card"><h2 style="margin-top:0">History & rollback</h2><p class="small muted">Restoring a version copies it into the draft (your current draft is kept in this list first). Nothing reaches students until you preview and publish.</p><div class="hist-body muted">Loading…</div></div>');
+      var hist = h('<div class="card"><h2 style="margin-top:0">History & rollback</h2><p class="small muted">Restoring a version copies it into the draft (your current draft is kept in the history first). Nothing reaches students until you preview and publish.</p><div class="hist-body muted">Loading…</div></div>');
       app.appendChild(hist);
-      CX.api('GET', '/api/admin/status').then(function (s) {
+      CX.api('vulvaAdminContentGet').then(function (s) {
         if (!s.ok) { $('.st-body', st).textContent = s.error; return; }
+        var lp = s.lastPublished;
         $('.st-body', st).classList.remove('muted');
         $('.st-body', st).innerHTML = '<table class="data"><tbody>' +
           '<tr><td>You are viewing</td><td>' + (IS_DRAFT ? '<span class="pill warn">Draft</span> (not visible to students)' : '<span class="pill good">Live</span> (what students see)') + '</td></tr>' +
-          '<tr><td>Draft</td><td>' + (s.draft ? 'Unpublished changes · last saved ' + esc(fmtTime(s.draft.savedAt)) + ' by ' + esc(s.draft.savedBy) + (s.draft.restoredFrom ? ' · restored from ' + esc(s.draft.restoredFrom) : '') : 'No unpublished changes') + '</td></tr>' +
-          '<tr><td>Last published</td><td>' + (s.published ? esc(fmtTime(s.published.at)) + ' by ' + esc(s.published.by) + ' — “' + esc(s.published.message) + '”' + (s.published.url ? ' · <a href="' + esc(s.published.url) + '" target="_blank" rel="noopener">GitHub commit</a>' : '') : 'Not yet published from the editor') + '</td></tr>' +
-          '<tr><td>GitHub</td><td>' + (s.github.configured ? '✓ Publishing commits to <b>' + esc(s.github.repo) + '</b> (branch ' + esc(s.github.branch) + ')' : '<span class="bad">Not configured</span> — publishing updates this server only. See DEPLOY.md.') + '</td></tr></tbody></table>';
+          '<tr><td>Draft</td><td>' + (s.draft ? 'Unpublished changes · last saved ' + esc(fmtTime(s.draft.at)) : 'No unpublished changes') + '</td></tr>' +
+          '<tr><td>Last published</td><td>' + (lp ? esc(fmtTime(lp.at)) + (lp.message ? ' — “' + esc(lp.message) + '”' : '') + (lp.url ? ' · <a href="' + esc(lp.url) + '" target="_blank" rel="noopener">GitHub commit</a>' : '') : 'Not yet published from the editor') + '</td></tr>' +
+          '<tr><td>GitHub</td><td>' + (s.github.configured ? '✓ Publishing to <b>' + esc(s.github.repo) + '</b> (branch ' + esc(s.github.branch) + ')' : '<span class="bad">Not set up</span> — add GITHUB_TOKEN and GITHUB_REPO to the Script Properties of your Apps Script project (SETUP.md, step 4).') + '</td></tr>' +
+          '<tr><td>Content key</td><td>' + (s.keyOk ? '✓ Set (CONTENT_KEYS in Code.gs)' : '<span class="bad">Missing or malformed</span> — see SETUP.md, step 3.') + '</td></tr></tbody></table>';
       });
-      CX.api('GET', '/api/admin/history').then(function (r) {
+      CX.api('vulvaAdminHistory').then(function (r) {
         var b = $('.hist-body', hist); b.classList.remove('muted');
         if (!r.ok) { b.textContent = r.error; return; }
-        var rows = r.local.map(function (x) { return { t: x.at, label: x.kind === 'published' ? '🚀 Published' + (x.message ? ': “' + x.message + '”' : '') : '💾 Draft' + (x.note ? ' (' + x.note + ')' : ''), by: x.by, id: x.id }; });
+        var rows = r.local.map(function (x) { return { t: x.at, label: x.kind === 'published' ? '🚀 Published' + (x.message ? ': “' + x.message + '”' : '') : '💾 Draft' + (x.note ? ' (' + x.note + ')' : ''), id: x.id }; });
         b.innerHTML = '';
-        if (r.github && r.github.length) {
+        if (Array.isArray(r.github) && r.github.length) {
           b.appendChild(h('<h3>Published versions on GitHub</h3>'));
           var tg = h('<div class="tablewrap"><table class="data"><tbody></tbody></table></div>');
-          r.github.forEach(function (c) { var tr = h('<tr><td>' + esc(fmtTime(Date.parse(c.date))) + '</td><td>' + esc(String(c.message).split('\n')[0]) + '</td><td class="small">' + esc(c.author || '') + '</td><td><a href="' + esc(c.url) + '" target="_blank" rel="noopener">view</a></td><td>' + (IS_DRAFT ? '<button class="btn small" type="button">Restore into draft</button>' : '') + '</td></tr>'); var bt = $('button', tr); if (bt) bt.onclick = function () { restore({ commit: c.sha }, 'the GitHub version from ' + fmtTime(Date.parse(c.date))); }; $('tbody', tg).appendChild(tr); });
+          r.github.forEach(function (c) { var tr = h('<tr><td>' + esc(fmtTime(Date.parse(c.date))) + '</td><td>' + esc(c.message) + '</td><td><a href="' + esc(c.url) + '" target="_blank" rel="noopener">view</a></td><td>' + (IS_DRAFT ? '<button class="btn small" type="button">Restore into draft</button>' : '') + '</td></tr>'); var bt = $('button', tr); if (bt) bt.onclick = function () { restore(function () { return CX.loadCommit(c.sha); }, 'the GitHub version from ' + fmtTime(Date.parse(c.date))); }; $('tbody', tg).appendChild(tr); });
           b.appendChild(tg);
         } else if (r.github && r.github.error) b.appendChild(h('<p class="small err">GitHub history could not be loaded: ' + esc(r.github.error) + '</p>'));
-        b.appendChild(h('<h3>Saved on this server</h3>'));
+        b.appendChild(h('<h3>Saved in your spreadsheet</h3>'));
         if (!rows.length) b.appendChild(h('<p class="muted small">No saved versions yet.</p>'));
         var t = h('<div class="tablewrap"><table class="data"><tbody></tbody></table></div>');
-        rows.forEach(function (x) { var tr = h('<tr><td>' + esc(fmtTime(x.t)) + '</td><td>' + esc(x.label) + '</td><td class="small">' + esc(x.by || '') + '</td><td>' + (IS_DRAFT ? '<button class="btn small" type="button">Restore into draft</button>' : '') + '</td></tr>'); var bt = $('button', tr); if (bt) bt.onclick = function () { restore({ id: x.id }, 'the version from ' + fmtTime(x.t)); }; $('tbody', t).appendChild(tr); });
+        rows.forEach(function (x) { var tr = h('<tr><td>' + esc(fmtTime(x.t)) + '</td><td>' + esc(x.label) + '</td><td>' + (IS_DRAFT ? '<button class="btn small" type="button">Restore into draft</button>' : '') + '</td></tr>'); var bt = $('button', tr); if (bt) bt.onclick = function () { restore(function () { return CX.api('vulvaAdminSnapshot', { id: x.id }).then(function (y) { if (!y.ok) throw new Error(y.error); return y.content; }); }, 'the version from ' + fmtTime(x.t)); }; $('tbody', t).appendChild(tr); });
         if (rows.length) b.appendChild(t);
       });
-      function restore(payload, label) {
-        A.confirmBox('Restore ' + label + '?', 'This replaces the current draft with that version (the current draft is saved in the history first). Students see nothing until you publish.', 'Restore into draft', function () {
-          clearTimeout(saveT); dirty = false;
-          CX.api('POST', '/api/admin/history/restore', payload).then(function (r) { if (r.ok) { toast('Restored into the draft.'); setTimeout(function () { location.reload(); }, 600); } else toast(r.error + (r.issues ? ' ' + r.issues.slice(0, 2).join(' · ') : '')); });
+      function restore(load, label) {
+        A.confirmBox('Restore ' + label + '?', 'This replaces the current draft with that version (the current draft stays in the history). Students see nothing until you publish.', 'Restore into draft', function () {
+          load().then(function (content) {
+            if (!content || !content.lectures) throw new Error('That version could not be read.');
+            snapshot(); replaceD(JSON.stringify(content)); changed(false);
+            return save(true).then(function (ok) { if (ok) { toast('Restored into the draft.'); setTimeout(function () { location.reload(); }, 600); } });
+          }).catch(function (e) { toast(e.message || String(e)); });
         });
       }
     }
@@ -1363,15 +1428,13 @@
         { k: 'title', label: 'Course title (home page)', required: true }, { k: 'short', label: 'Short title (top bar)', required: true }, { k: 'subject', label: 'Subject (in sentences, lower case)' },
         { k: 'audience', label: 'Audience' }, { k: 'author', label: 'Teacher' }, { k: 'role', label: 'Teacher role' }, { k: 'dept', label: 'Department' }, { k: 'contentNote', label: 'Content source note (footer)' }
       ], rec = Object.assign({}, M);
-      Object.keys(D.tests).forEach(function (t) { spec.push({ k: 'test_' + t + '_title', label: 'Assessment “' + t + '” — title' }, { k: 'test_' + t + '_sub', label: 'Assessment “' + t + '” — subtitle' }, { k: 'test_' + t + '_minutes', label: 'Assessment “' + t + '” — default time limit (minutes)', type: 'number', min: 5, max: 240 }); rec['test_' + t + '_title'] = D.tests[t].title; rec['test_' + t + '_sub'] = D.tests[t].sub; rec['test_' + t + '_minutes'] = D.tests[t].minutes; });
       Object.keys(D.topics).forEach(function (k) { spec.push({ k: 'topic_' + k, label: 'Results topic: ' + D.topics[k].name }); rec['topic_' + k] = D.topics[k].name; });
       formEditor('Course settings', spec, rec, function (v) {
         change(function () {
           ['title', 'short', 'subject', 'audience', 'author', 'role', 'dept', 'contentNote'].forEach(function (k) { M[k] = v[k]; });
-          Object.keys(D.tests).forEach(function (t) { D.tests[t].title = v['test_' + t + '_title']; D.tests[t].sub = v['test_' + t + '_sub']; D.tests[t].minutes = Math.max(5, Math.min(240, v['test_' + t + '_minutes'] || D.tests[t].minutes)); });
           Object.keys(D.topics).forEach(function (k) { if (v['topic_' + k]) D.topics[k].name = v['topic_' + k]; });
         });
-        toast('Settings saved to the draft. The top bar title updates after you reload.');
+        toast('Settings saved to the draft. Assessment titles and times are set in Teacher portal → Assessments.');
       }, { wide: true });
     }
 
@@ -1402,5 +1465,123 @@
     var mo = new MutationObserver(function () { if (isEditing() && !openPanel) decorateQuestions(A.app()); });
     mo.observe(A.app(), { childList: true, subtree: true });
     updateBar();
+  };
+})();
+(function () {
+  'use strict';
+  /* ---------- pictures: data: URL → content-addressed, encrypted file; uploaded in batches ---------- */
+  var EXT = { 'image/jpeg': 'jpg', 'image/png': 'png', 'image/gif': 'gif', 'image/webp': 'webp' };
+  function b64(u8) { var s = '', CH = 0x8000; for (var i = 0; i < u8.length; i += CH) s += String.fromCharCode.apply(null, u8.subarray(i, i + CH)); return btoa(s); }
+  function mediaTools(CX) {
+    /* data: URL → { file: '<sha-256, 32 hex>.<ext>', type, bytes, blob, enc (base64 of IV ‖ AES-GCM ciphertext) } */
+    function prepare(dataUrls) {
+      return Promise.all(dataUrls.map(function (dataUrl) {
+        var m = /^data:([^;,]+)(;base64)?,(.*)$/.exec(dataUrl); if (!m || !EXT[m[1]]) return Promise.reject(new Error('Use a JPG, PNG, GIF or WebP picture.'));
+        var bin = m[2] ? atob(m[3]) : decodeURIComponent(m[3]), u8 = new Uint8Array(bin.length); for (var i = 0; i < bin.length; i++) u8[i] = bin.charCodeAt(i);
+        return crypto.subtle.digest('SHA-256', u8).then(function (hb) {
+          var hex = Array.prototype.map.call(new Uint8Array(hb), function (x) { return ('0' + x.toString(16)).slice(-2); }).join('').slice(0, 32);
+          return CX.encrypt(u8).then(function (enc) { return { file: hex + '.' + EXT[m[1]], type: m[1], bytes: u8.length, blob: new Blob([u8], { type: m[1] }), enc: b64(enc) }; });
+        });
+      }));
+    }
+    /* Sends encrypted pictures to the backend in batches (one GitHub commit per batch). */
+    function put(list, onProgress) {
+      var batches = [], cur = [], size = 0;
+      list.forEach(function (f) { if (cur.length && (cur.length >= 12 || size + f.enc.length > 6e6)) { batches.push(cur); cur = []; size = 0; } cur.push(f); size += f.enc.length; });
+      if (cur.length) batches.push(cur);
+      var done = 0;
+      return batches.reduce(function (pr, batch) {
+        return pr.then(function () {
+          return CX.api('vulvaAdminMediaPut', { files: batch.map(function (f) { return { path: 'content/media/' + f.file + '.enc', base64: f.enc }; }) }).then(function (r) {
+            if (!r.ok) throw new Error(r.error || 'The pictures could not be saved.');
+            batch.forEach(function (f) { CX.media.prime('media/' + f.file, f.blob); });
+            done += batch.length; if (onProgress) onProgress(done, list.length);
+          });
+        });
+      }, Promise.resolve()).then(function () { return list; });
+    }
+    return { prepare: prepare, put: put, b64: b64 };
+  }
+  window.VULVA_MEDIA = mediaTools;
+
+  /* ---------- import a course from a file ----------
+     Accepts: the connected edition page (…-connected.html: content encrypted with this module's key, opened here
+     with the key from the sign-in), the offline edition page (content embedded in plain text), or a content .json.
+     Practice/assessment questions are never put into the published content — they belong in the question bank. */
+  function esc(s) { return String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;'); }
+  function scriptText(html, id) {
+    var m = new RegExp('<script[^>]*id="' + id + '"[^>]*>([\\s\\S]*?)</script>').exec(html);
+    return m ? m[1].trim() : null;
+  }
+  function readCourse(CX, text) {
+    var t = text.trim();
+    if (t.charAt(0) === '{') return Promise.resolve(JSON.parse(t));
+    var data = scriptText(t, 'cvs-data'), enc = scriptText(t, 'cvs-enc'), extraPics = scriptText(t, 'cvs-pics');
+    var p = data ? Promise.resolve(JSON.parse(data)) : enc ? CX.decrypt(Uint8Array.from(atob(enc), function (c) { return c.charCodeAt(0); }).buffer).then(function (pt) { return JSON.parse(new TextDecoder().decode(pt)); }, function () {
+      throw new Error('This page is encrypted with a different key than this module’s (CONTENT_KEYS in Code.gs). Use the connected page of THIS module.');
+    }) : Promise.reject(new Error('No course content was found in this file.'));
+    return p.then(function (D) { if (extraPics) { try { D.pics = Object.assign(D.pics || {}, JSON.parse(extraPics)); } catch (e) { } } return D; });
+  }
+  function convert(CX, D, log) {
+    if (!D || !Array.isArray(D.lectures) || !D.meta) return Promise.reject(new Error('This file does not contain a course.'));
+    var notes = [], q = (D.questions || []).length, pr = (D.practice || []).length;
+    if (q || pr) notes.push(q + ' assessment and ' + pr + ' practice question(s) in the file were NOT put into the content (their answers must stay private). The question bank on the platform is managed in Teacher portal → Question bank / Import.');
+    delete D.questions; delete D.practice; delete D.tests;
+    D.checks = D.checks || []; D.review = D.review || {}; D.concepts = D.concepts || {}; D.topics = D.topics || {}; D.pics = D.pics || {}; D.media = D.media || {};
+    D.meta.edition = 'connected';
+    // every embedded picture (picture slots and slide pictures) becomes an encrypted library file
+    var refs = [];
+    Object.keys(D.pics).forEach(function (k) { var p = D.pics[k]; if (!p) { delete D.pics[k]; return; } if (/^data:image\//.test(p.src || '')) refs.push({ o: p, title: p.caption || '' }); });
+    Object.keys(D.decks || {}).forEach(function (n) { ((D.decks[n] || {}).slides || []).forEach(function (s) { (s.images || []).forEach(function (im) { if (/^data:image\//.test(im.src || '')) refs.push({ o: im, title: im.caption || '' }); }); }); });
+    var bad = Object.keys(D.pics).filter(function (k) { return !/^(data:image\/|media\/[a-f0-9]{32}\.)/.test(D.pics[k].src || ''); });
+    bad.forEach(function (k) { delete D.pics[k]; });
+    if (bad.length) notes.push(bad.length + ' picture(s) pointed to files outside the library and were left out (add them again with “Add picture”).');
+    var T = mediaTools(CX), uniq = {}, list = [];
+    log('Encrypting ' + refs.length + ' picture(s)…');
+    return T.prepare(refs.map(function (r) { return r.o.src; })).then(function (files) {
+      files.forEach(function (f, i) { refs[i].o.src = 'media/' + f.file; if (!uniq[f.file]) { uniq[f.file] = 1; list.push(f); D.media[f.file] = D.media[f.file] || { title: refs[i].title, alt: '', description: '', type: f.type, bytes: f.bytes, uploadedAt: Date.now() }; } });
+      log('Uploading ' + list.length + ' encrypted picture(s) to GitHub…');
+      return T.put(list, function (n, all) { log('Uploading encrypted pictures to GitHub… ' + n + ' / ' + all); });
+    }).then(function () { return { content: D, notes: notes, pictures: list.length }; });
+  }
+  function importCourse(CX, onDone, opts) {
+    opts = opts || {};
+    var bg = document.createElement('div'); bg.className = 'modal-bg';
+    bg.innerHTML = '<div class="modal wide" role="dialog" aria-modal="true" aria-label="Import the course"><h3>' + (opts.first ? 'Set up the course' : 'Import course from a file') + '</h3><div class="mbody">' +
+      (opts.first ? '<p>Nothing has been published from this platform yet. Choose the course file to start from:</p>' : '<p>This replaces the draft with the course in the file (the current draft stays in the history).</p>') +
+      '<ul class="small"><li><b>Your connected page</b> (for example <code>' + esc(CX.module) + '-connected.html</code>) — recommended. It is opened here with this module’s key; nothing readable leaves your browser.</li><li>Or the offline edition page, or a content <code>.json</code> file.</li></ul>' +
+      '<p class="small muted">Pictures are encrypted in this browser and stored in the GitHub repository by the platform (this needs the GitHub settings — SETUP.md, step 4). Practice and assessment questions are not imported here: they stay in the question bank (Teacher portal → Import).</p>' +
+      '<label class="btn primary">📄 Choose the file<input type="file" accept=".html,.htm,.json,text/html,application/json" hidden></label><div class="imp-log small" style="margin-top:12px" aria-live="polite"></div></div>' +
+      '<div class="row" style="justify-content:flex-end;margin-top:16px"><button class="btn imp-x" type="button">' + (opts.first ? 'Sign out' : 'Cancel') + '</button></div></div>';
+    document.body.appendChild(bg);
+    var logEl = bg.querySelector('.imp-log'), busy = false;
+    function log(t, cls) { logEl.innerHTML = '<p class="' + (cls || '') + '">' + esc(t) + '</p>'; }
+    bg.querySelector('.imp-x').onclick = function () { if (busy) return; if (opts.first) CX.logout(); else bg.remove(); };
+    bg.querySelector('input').onchange = function (e) {
+      var f = e.target.files[0]; e.target.value = ''; if (!f || busy) return;
+      busy = true; log('Reading ' + f.name + '…');
+      f.text().then(function (text) { return readCourse(CX, text); }).then(function (D) { return convert(CX, D, log); }).then(function (r) {
+        busy = false;
+        logEl.innerHTML = '<p class="good"><b>✓ Ready:</b> ' + r.content.lectures.length + ' lecture(s), ' + r.content.checks.length + ' section check(s), ' + r.pictures + ' picture(s) uploaded (encrypted).</p>' + r.notes.map(function (n) { return '<p class="note">' + esc(n) + '</p>'; }).join('') + '<button class="btn primary imp-go" type="button">Put it into the draft</button>';
+        logEl.querySelector('.imp-go').onclick = function () { bg.remove(); onDone(r.content); };
+      }).catch(function (er) { busy = false; log(er.message || String(er), 'err'); });
+    };
+  }
+  window.VULVA_IMPORT = importCourse;
+  /* boot.js calls this for a teacher when there is no content anywhere yet (first-time setup). */
+  window.VULVA_SETUP = function (CX) {
+    var admin = CX.admin || {};
+    if (admin.github && !admin.github.configured) {
+      var bg = document.createElement('div'); bg.className = 'modal-bg';
+      bg.innerHTML = '<div class="modal" role="dialog" aria-modal="true"><h3>Almost there</h3><div class="mbody"><p>Before the course can be set up, the platform needs to be able to publish to GitHub. Add <b>GITHUB_TOKEN</b> and <b>GITHUB_REPO</b> to the Script Properties of your Apps Script project (SETUP.md, step 4), then reload this page.</p></div><div class="row" style="justify-content:flex-end;margin-top:16px"><button class="btn primary" type="button">Reload</button></div></div>';
+      bg.querySelector('button').onclick = function () { location.reload(); };
+      document.body.appendChild(bg); return;
+    }
+    importCourse(CX, function (content) {
+      CX.api('vulvaAdminContentSave', { content: content, baseRev: CX.rev || 0, checkpoint: true }).then(function (r) {
+        if (!r.ok) { window.alert((r.error || 'The draft could not be saved.') + (r.issues ? '\n• ' + r.issues.join('\n• ') : '')); location.reload(); return; }
+        CX.setView('draft');
+      });
+    }, { first: true });
   };
 })();

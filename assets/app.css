@@ -379,3 +379,7 @@ details.ty .tyb{padding:0 14px 12px}
 @media (max-width:1480px){.nav a[data-k=faculty] .lbl{display:none}}
 @media (max-width:1380px){.nav a[data-k=progress] .lbl,.nav a[data-k=home] .lbl,.userchip .lbl{display:none}}
 @media (max-width:1260px){.nav .lbl{display:none}}
+/* encrypted pictures while they are being unlocked */
+img[data-media].loading{min-height:120px;background:linear-gradient(90deg,#eef2f6,#f7f9fb,#eef2f6);background-size:200% 100%;animation:shim 1.2s linear infinite}
+img[data-media].broken{min-height:60px;outline:1px dashed var(--line)}
+@keyframes shim{to{background-position:-200% 0}}

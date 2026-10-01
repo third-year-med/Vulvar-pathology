@@ -10,7 +10,7 @@
  *   vulvaAdminContentSave     save the draft (optimistic concurrency: baseRev must match)
  *   vulvaAdminContentDiscard  throw the draft away (a copy is kept in the history)
  *   vulvaAdminPublish         commit the ENCRYPTED content (+ version.json) to GitHub → GitHub Pages updates
- *   vulvaAdminMediaPut        commit one ENCRYPTED picture to GitHub (content-addressed file name)
+ *   vulvaAdminMediaPut        commit ENCRYPTED pictures to GitHub (one, or up to 40 in one commit; content-addressed names)
  *   vulvaAdminHistory         saved versions on this server + published versions on GitHub
  *   vulvaAdminSnapshot        read one saved version (to restore it into the draft)
  *
@@ -26,6 +26,8 @@
  *   GITHUB_TOKEN   fine-grained token, this repository only, "Contents: Read and write"
  *   GITHUB_REPO    owner/repository  (e.g. third-year-med/Vulvar-pathology)
  *   GITHUB_BRANCH  branch GitHub Pages publishes from (default: main)
+ *   GITHUB_REPO_VAGINA / GITHUB_BRANCH_VAGINA  (optional) a separate repository for the vagina module's site
+ *   After adding this file, run gyncAuthorize() once from the editor to grant the external-request permission.
  * ========================================================================== */
 var GYNC_SHEET = 'GYN_Content';
 var GYNC_COLS = 16;                 // JSON split across 16 cells of ≤45 000 characters (≈720 000 characters per record)
@@ -125,10 +127,25 @@ function gyncValidate_(c) {
 }
 
 /* ---------------- GitHub ---------------- */
-function gyncGhConfig_() {
-  var pr = PropertiesService.getScriptProperties();
-  var repo = String(pr.getProperty('GITHUB_REPO') || '').trim(), token = pr.getProperty('GITHUB_TOKEN') || '';
-  return { token: token, repo: repo, branch: String(pr.getProperty('GITHUB_BRANCH') || 'main').trim(), ok: !!(token && /^[\w.-]+\/[\w.-]+$/.test(repo)) };
+function gyncGhConfig_(module) {
+  // per-module repository first (GITHUB_REPO_VAGINA, …), so each sub-module can publish to its own site
+  var pr = PropertiesService.getScriptProperties(), M = String(module || '').split('-')[0].toUpperCase();
+  var repo = String(pr.getProperty('GITHUB_REPO_' + M) || pr.getProperty('GITHUB_REPO') || '').trim(), token = pr.getProperty('GITHUB_TOKEN') || '';
+  var branch = String(pr.getProperty('GITHUB_BRANCH_' + M) || pr.getProperty('GITHUB_BRANCH') || 'main').trim();
+  return { token: token, repo: repo, branch: branch, ok: !!(token && /^[\w.-]+\/[\w.-]+$/.test(repo)) };
+}
+/** Run this ONCE from the Apps Script editor (select it, press ▶ Run) to grant the "connect to an external
+ *  service" permission that publishing needs; it also checks the GitHub settings. It never prints the token. */
+function gyncAuthorize() {
+  var out = [];
+  ['vulva', 'vagina'].forEach(function (m) {
+    var cfg = gyncGhConfig_(m);
+    if (!cfg.ok) { out.push(m + ': GitHub not configured (GITHUB_TOKEN and GITHUB_REPO' + ' in Script properties).'); return; }
+    try { gyncGh_(cfg, 'GET', ''); out.push(m + ': OK — can reach ' + cfg.repo + ' (branch ' + cfg.branch + ').'); }
+    catch (e) { out.push(m + ': ' + cfg.repo + ' — ' + (e.status === 404 ? 'not found (check the name, and that the token has access to it)' : e.status === 401 ? 'the token is not valid' : e.message)); }
+  });
+  Logger.log(out.join('\n'));
+  return out.join('\n');
 }
 function gyncGh_(cfg, method, path, body) {
   var res = UrlFetchApp.fetch('https://api.github.com/repos/' + cfg.repo + path, {
@@ -160,9 +177,9 @@ function gyncCommit_(cfg, files, message) {
 
 /* ---------------- actions ---------------- */
 function gyncInfo_(module) {
-  var cfg = gyncGhConfig_(), key = contentKey_(module);
+  var cfg = gyncGhConfig_(module), key = contentKey_(module);
   var pubs = gyncRows_(module, 'published').sort(function (a, b) { return b.at - a.at; });
-  var last = pubs[0] ? { at: pubs[0].at, by: pubs[0].by, rev: pubs[0].rev, note: gynJ_(pubs[0].note, {}) } : null;
+  var n = pubs[0] ? gynJ_(pubs[0].note, {}) : {}, last = pubs[0] ? { at: pubs[0].at, by: pubs[0].by, rev: pubs[0].rev, message: n.message || '', commit: n.commit || '', url: n.url || '' } : null;
   return { github: { configured: cfg.ok, repo: cfg.ok ? cfg.repo : '', branch: cfg.branch }, keyOk: /^[A-Za-z0-9+/]{43}=$/.test(String(key || '')), lastPublished: last };
 }
 function gyncGet_(module) {
@@ -194,7 +211,7 @@ function gyncDiscard_(module, now) {
   return { ok: true };
 }
 function gyncPublish_(module, p, now) {
-  var cfg = gyncGhConfig_();
+  var cfg = gyncGhConfig_(module);
   if (!cfg.ok) return { ok: false, code: 'nogithub', error: 'Publishing needs GitHub settings in Script Properties (GITHUB_TOKEN, GITHUB_REPO). See SETUP.md.' };
   var d = gyncDraft_(module);
   if (!d) return { ok: false, code: 'nodraft', error: 'There is no draft to publish.' };
@@ -220,18 +237,30 @@ function gyncPublish_(module, p, now) {
   return { ok: true, commit: commit.sha, url: commit.url, publishedAt: now };
 }
 function gyncMediaPut_(module, p) {
-  var cfg = gyncGhConfig_();
+  var cfg = gyncGhConfig_(module);
   if (!cfg.ok) return { ok: false, code: 'nogithub', error: 'Uploading pictures needs GitHub settings in Script Properties (GITHUB_TOKEN, GITHUB_REPO). See SETUP.md.' };
-  var path = String(p.path || ''), b64 = String(p.base64 || '');
-  if (!GYNC_MEDIA_RE.test(path)) return { ok: false, code: 'badpath', error: 'Invalid picture file name.' };
-  if (!/^[A-Za-z0-9+/]+=*$/.test(b64) || b64.length < 40) return { ok: false, code: 'badfile', error: 'The picture data is missing.' };
-  if (b64.length * 0.75 > GYNC_MAX_MEDIA) return { ok: false, code: 'toolarge', error: 'The picture is too large (maximum 12 MB).' };
+  // one picture { path, base64 } or several { files: [{ path, base64 }, …] } in ONE commit
+  var files = Array.isArray(p.files) ? p.files : [{ path: p.path, base64: p.base64 }], total = 0;
+  if (!files.length || files.length > 40) return { ok: false, code: 'badfile', error: 'Send between 1 and 40 pictures at a time.' };
+  for (var i = 0; i < files.length; i++) {
+    var f = files[i] || {}, path = String(f.path || ''), b64 = String(f.base64 || '');
+    if (!GYNC_MEDIA_RE.test(path)) return { ok: false, code: 'badpath', error: 'Invalid picture file name.' };
+    if (!/^[A-Za-z0-9+/]+=*$/.test(b64) || b64.length < 40) return { ok: false, code: 'badfile', error: 'The picture data is missing.' };
+    if (b64.length * 0.75 > GYNC_MAX_MEDIA) return { ok: false, code: 'toolarge', error: 'A picture is too large (maximum 12 MB).' };
+    total += b64.length;
+  }
+  if (total * 0.75 > 30 * 1024 * 1024) return { ok: false, code: 'toolarge', error: 'Too much at once — send fewer pictures per request.' };
   try {
-    // content-addressed: if the file is already in the repository, there is nothing to do
-    try { gyncGh_(cfg, 'GET', '/contents/' + path + '?ref=' + encodeURIComponent(cfg.branch)); return { ok: true, path: path, existing: true }; }
-    catch (e) { if (e.status !== 404) throw e; }
-    var c = gyncCommit_(cfg, [{ path: path, base64: b64 }], 'Add picture ' + path.split('/').pop().slice(0, 12) + '… (encrypted)');
-    return { ok: true, path: path, commit: c.sha };
+    // content-addressed: files already in the repository are skipped
+    var todo = [], existing = [];
+    files.forEach(function (f) {
+      try { gyncGh_(cfg, 'GET', '/contents/' + f.path + '?ref=' + encodeURIComponent(cfg.branch)); existing.push(f.path); }
+      catch (e) { if (e.status !== 404) throw e; todo.push({ path: String(f.path), base64: String(f.base64) }); }
+    });
+    var c = todo.length ? gyncCommit_(cfg, todo, todo.length === 1 ? 'Add picture ' + todo[0].path.split('/').pop().slice(0, 12) + '… (encrypted)' : 'Add ' + todo.length + ' pictures (encrypted)') : null;
+    var out = { ok: true, saved: todo.map(function (f) { return f.path; }), existing: existing, commit: c ? c.sha : '' };
+    if (!Array.isArray(p.files)) { out.path = files[0].path; if (existing.length) out.existing = true; }
+    return out;
   } catch (e) {
     return { ok: false, code: 'github', error: 'The picture could not be saved to GitHub. ' + (e && e.message || e) };
   }
@@ -240,7 +269,7 @@ function gyncHistory_(module) {
   var local = gyncRows_(module).filter(function (r) { return r.kind === 'snapshot' || r.kind === 'published'; })
     .sort(function (a, b) { return b.at - a.at; }).slice(0, 100)
     .map(function (r) { var n = r.kind === 'published' ? gynJ_(r.note, {}) : null; return { id: r.id, kind: r.kind, at: r.at, by: r.by, rev: r.rev, note: r.kind === 'published' ? '' : r.note, message: n ? n.message : '', commit: n ? n.commit : '', url: n ? n.url : '' }; });
-  var cfg = gyncGhConfig_(), gh = null;
+  var cfg = gyncGhConfig_(module), gh = null;
   if (cfg.ok) {
     try {
       gh = (gyncGh_(cfg, 'GET', '/commits?sha=' + encodeURIComponent(cfg.branch) + '&path=content/content.enc&per_page=30') || []).map(function (c) {

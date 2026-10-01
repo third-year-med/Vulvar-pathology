@@ -1,14 +1,17 @@
-/* Vulvar Pathology Exam Review — learner app.
-   main(D, CX) is started by boot.js after sign-in. D = the educational content delivered by the server
-   (live version for students; the draft for teachers who are editing). CX = the server connection:
-   { role: 'student' | 'admin', name, api(method, url, body), logout() }.
-   Practice progress and results stay in this browser (the shared student login has no personal identity).
-   Teacher editing tools live in a separate file (/admin/editor.js) that the server sends to teachers only;
-   it plugs in through the HOOKS object below. */
+/* Vulvar Pathology Exam Review — learner app (connected to the platform's Apps Script backend).
+   main(D, CX) is started by boot.js after sign-in.
+   D  = the Learn content (lectures, section checks, review, pictures, slides), decrypted in this browser with
+        the key the backend releases only after sign-in (teachers who edit get their draft instead).
+   CX = the connection: { role: 'student' | 'admin', username, name, api(action, payload) → Promise, logout(), … }.
+   Practice and assessment questions are NOT in D: they live in the backend question bank (Gyn.gs) and are
+   fetched, checked and graded there, so answers never reach the browser before they should.
+   The teacher editor (editor.js) plugs in through the HOOKS object below; every change it makes is checked
+   again by the backend (teacher session), so hiding it from students is only for tidiness. */
 (function () {
 'use strict';
 function main(D, CX) {
-var P = D.meta.storagePrefix + (CX.role === 'admin' ? 't_' : '');
+var MOD = String(CX.module || 'vulva').split('-')[0];
+var P = (D.meta.storagePrefix || MOD + '_') + (CX.role === 'admin' ? 't_' : 'u_' + String(CX.username || '').toLowerCase().replace(/[^a-z0-9]+/g, '') + '_');
 // Extension points used by the teacher editor (absent for students: all no-ops).
 var HOOKS = { afterRender: null, contentChanged: null, uploadImage: null, route: null, faculty: null, figTools: null, editing: function () { return false; } };
 var APP_VERSION = D.meta.version;
@@ -17,9 +20,21 @@ try { localStorage.setItem(P + '__t', '1'); localStorage.removeItem(P + '__t'); 
 var mem = {};
 var store = {
   get: function (k, d) { try { var v = STORAGE_OK ? localStorage.getItem(P + k) : mem[k]; return v == null ? d : JSON.parse(v); } catch (e) { return d; } },
-  set: function (k, v) { var s = JSON.stringify(v); try { if (STORAGE_OK) localStorage.setItem(P + k, s); else mem[k] = s; } catch (e) { mem[k] = s; toast('Browser storage is full or blocked — results may not be saved.'); } },
+  set: function (k, v, noSync) { var s = JSON.stringify(v); try { if (STORAGE_OK) localStorage.setItem(P + k, s); else mem[k] = s; } catch (e) { mem[k] = s; } if (!noSync && SYNC_KINDS[k]) queueSync(k); },
   del: function (k) { try { if (STORAGE_OK) localStorage.removeItem(P + k); delete mem[k]; } catch (e) {} }
 };
+
+// Study progress that follows the student to every device (saved on the backend, vulvaProgressSave).
+var SYNC_KINDS = { studied: 'studied', facts2: 'facts', checks: 'checks', last: 'last' }, syncQ = {}, syncT = null;
+function queueSync(k) {
+  if (CX.role !== 'student') return;
+  syncQ[k] = 1; clearTimeout(syncT);
+  syncT = setTimeout(function () {
+    var items = Object.keys(syncQ).map(function (key) { return { kind: SYNC_KINDS[key], value: store.get(key, {}) }; }); syncQ = {};
+    CX.api('vulvaProgressSave', { items: items });
+  }, 2500);
+}
+window.addEventListener('pagehide', function () { if (Object.keys(syncQ).length) { clearTimeout(syncT); var items = Object.keys(syncQ).map(function (key) { return { kind: SYNC_KINDS[key], value: store.get(key, {}) }; }); syncQ = {}; CX.api('vulvaProgressSave', { items: items }, { keepalive: true }); } });
 
 /* ---------------- helpers ---------------- */
 function esc(s) { return String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;'); }
@@ -33,7 +48,6 @@ function pct(a, b) { return b ? Math.round(1000 * a / b) / 10 : 0; }
 function median(a) { if (!a.length) return 0; var s = a.slice().sort(function (x, y) { return x - y; }); var m = Math.floor(s.length / 2); return s.length % 2 ? s[m] : (s[m - 1] + s[m]) / 2; }
 function uid(p) { return p + '-' + Date.now().toString(36) + Math.random().toString(36).slice(2, 7); }
 var LETTERS = 'ABCDEFG';
-function settings() { var s = store.get('settings', {}); var base = {}; Object.keys(D.tests).forEach(function (t) { base[t] = D.tests[t].minutes; }); return { pass: s.pass || 50, minutes: Object.assign(base, s.minutes || {}) }; }
 function sha256(text) {
   if (!(window.crypto && crypto.subtle)) return Promise.resolve('nocrypto');
   return crypto.subtle.digest('SHA-256', new TextEncoder().encode(text)).then(function (b) {
@@ -87,6 +101,9 @@ function inl(s) {
   t = t.replace(/(^|[^*\w])\*(?!\s)([^*]+?)\*(?!\w)/g, '$1<em>$2</em>');
   return t;
 }
+/** Pictures in the media library are stored encrypted; boot.js decrypts every <img data-media> after sign-in. */
+var BLANK = 'data:image/gif;base64,R0lGODlhAQABAAAAACH5BAEKAAEALAAAAAABAAEAAAICTAEAOw==';
+function imgTag(src, attrs) { src = String(src || ''); return /^media\//.test(src) ? '<img src="' + BLANK + '" data-media="' + esc(src) + '" ' + attrs + '>' : '<img src="' + esc(src) + '" ' + attrs + ' loading="lazy">'; }
 var MICRO = '<svg viewBox="0 0 48 48" aria-hidden="true"><rect width="48" height="48" rx="10" fill="#e3f3f2"/><path d="M18 10h8v4h-2v10a8 8 0 1 1-4 0V14h-2z" fill="none" stroke="#0e7c7b" stroke-width="2.4" stroke-linejoin="round"/><path d="M12 38h24" stroke="#0f2a4a" stroke-width="2.6" stroke-linecap="round"/><circle cx="22" cy="31" r="3" fill="#0e7c7b"/></svg>';
 function figCard(desc) {
   // Picture slot. Identified by its description (e.g. "pic:vu012"), so the same slot shows the same picture in the lecture, questions and slides.
@@ -95,7 +112,7 @@ function figCard(desc) {
   var attrs = ' data-pic="' + key + '" data-desc="' + esc(desc) + '"' + (E ? ' tabindex="0"' : '');
   if (p) {
     var al = p.align && p.align !== 'center' ? ' al-' + p.align : '', w = p.width && p.width < 100 && p.align !== 'full' ? ' style="--w:' + (+p.width) + '%"' : '';
-    return '<figure class="fig pic' + al + (w ? ' sized' : '') + '"' + attrs + w + '>' + (p.title ? '<div class="fig-t">' + inl(p.title) + '</div>' : '') + '<img src="' + esc(p.src) + '" alt="' + esc(p.alt || p.caption || desc) + '" title="Click to enlarge" loading="lazy"><figcaption class="cap">' + inl(p.caption || desc) + (p.description ? '<div class="small">' + inl(p.description) + '</div>' : '') + (p.credit ? '<div class="small muted">' + inl(p.credit) + '</div>' : '') + '</figcaption>' + tools + '</figure>';
+    return '<figure class="fig pic' + al + (w ? ' sized' : '') + '"' + attrs + w + '>' + (p.title ? '<div class="fig-t">' + inl(p.title) + '</div>' : '') + imgTag(p.src, 'alt="' + esc(p.alt || p.caption || desc) + '" title="Click to enlarge"') + '<figcaption class="cap">' + inl(p.caption || desc) + (p.description ? '<div class="small">' + inl(p.description) + '</div>' : '') + (p.credit ? '<div class="small muted">' + inl(p.credit) + '</div>' : '') + '</figcaption>' + tools + '</figure>';
   }
   return '<figure class="fig"' + attrs + '>' + MICRO + '<figcaption class="cap"><b>Image:</b> ' + inl(desc) + (E ? '<div class="small muted">No picture added yet.</div>' : '') + '</figcaption>' + tools + '</figure>';
 }
@@ -170,7 +187,7 @@ function md(src, opts) {
 }
 
 /* ---------------- data indexes ---------------- */
-var SECTIONS, SUBS, ORDER, NUM, QBY, QID, CHECKS_BY_SEC, CHECK_ID, PR, PID, PBY_SUB, PBY_CONCEPT, CONCEPTS, QBY_CONCEPT, SEC_TOPIC, RV;
+var SECTIONS, SUBS, ORDER, NUM, CHECKS_BY_SEC, CHECK_ID, PR, PID, PBY_SUB, PBY_CONCEPT, CONCEPTS, SEC_TOPIC, RV;
 function reindex() {
   // Lookup tables built from D. Called again by the teacher editor after every structural change.
   // Ids never change; NUM holds the displayed numbers, which follow the current order.
@@ -182,18 +199,22 @@ function reindex() {
       s.subs.forEach(function (u, j) { u.section = s.id; u.lecture = L.num; SUBS[u.id] = u; NUM[u.id] = sn + '.' + (j + 1); });
     });
   });
-  // Graded questions: QID keeps retired ones (old results still show them); QBY only has the current paper.
-  QBY = {}; Object.keys(D.tests).forEach(function (t) { QBY[t] = []; }); QID = {};
-  D.questions.forEach(function (q) { QID[q.id] = q; if (!q.retired) (QBY[q.test] = QBY[q.test] || []).push(q); });
+  D.checks = D.checks || []; D.tests = D.tests || {};
   CHECKS_BY_SEC = {}; CHECK_ID = {}; D.checks.forEach(function (c) { CHECK_ID[c.id] = c; (CHECKS_BY_SEC[c.sec] = CHECKS_BY_SEC[c.sec] || []).push(c); });
-  PR = D.practice; PID = {}; PBY_SUB = {}; PBY_CONCEPT = {}; CONCEPTS = D.concepts;
+  CONCEPTS = D.concepts;
+  // Practice questions: the server's index (ids + where they belong), in the teacher's chosen order.
+  var order = ((D.questionOrder || {}).practice || []), pos = {}; order.forEach(function (id, i) { pos[id] = i; });
+  PR = (SV.practiceIndex || []).slice().sort(function (a, b) { var x = id2pos(a.id), y = id2pos(b.id); return x - y || (a.id < b.id ? -1 : 1); });
+  function id2pos(id) { return id in pos ? pos[id] : 1e6; }
+  PID = {}; PBY_SUB = {}; PBY_CONCEPT = {};
   PR.forEach(function (x) { PID[x.id] = x; (PBY_SUB[x.sub] = PBY_SUB[x.sub] || []).push(x); (PBY_CONCEPT[x.concept] = PBY_CONCEPT[x.concept] || []).push(x); });
-  QBY_CONCEPT = {}; D.questions.forEach(function (q) { (QBY_CONCEPT[q.concept] = QBY_CONCEPT[q.concept] || []).push(q); });
   SEC_TOPIC = {}; Object.keys(D.topics).forEach(function (k) { D.topics[k].sections.forEach(function (sid) { SEC_TOPIC[sid] = k; }); });
   RV = D.review; ['facts', 'traps', 'comparisons', 'morphology', 'review15'].forEach(function (k) { RV[k] = RV[k] || []; });
   PICS = D.pics || (D.pics = {});
 }
 function num(id) { return NUM[id] || id; }
+/** topic of a practice question: by its section, or by the section of its learning block */
+function secTopic(x) { return SEC_TOPIC[x.section] || SEC_TOPIC[(SUBS[x.sub] || SUBS[x.section] || {}).section] || ''; }
 function conceptName(k) { return CONCEPTS[k] ? CONCEPTS[k].name : k; }
 function conceptLink(k) { var c = CONCEPTS[k]; if (!c) return '#/learn'; var s = c.subs[0] || c.sections[0]; return subLink(s); }
 function subLink(id) { if (SECTIONS[id]) return secLink(id); var u = SUBS[id]; return u ? '#/lecture/' + u.lecture + '/' + u.section + '/' + u.id : '#/learn'; }
@@ -213,15 +234,16 @@ function shell() {
   document.body.insertBefore(h('<header class="topbar"><div class="topbar-in"><a class="brand" href="#/">' + logo + '<span><div class="brand-t">' + esc(D.meta.short) + '</div></span></a>' +
     '<nav class="nav" aria-label="Main">' + NAV.map(function (n) { return '<a href="' + n[1] + '" data-k="' + n[0] + '"><span class="ico" aria-hidden="true">' + n[2] + '</span><span class="lbl">' + n[3] + '</span></a>'; }).join('') + '</nav>' +
     '<form class="searchbox" role="search"><label class="sr-only" for="gsearch">Search lectures, facts and comparisons</label><input id="gsearch" type="search" placeholder="Search…"></form>' +
-    '<div class="userchip"><button class="btn uc" type="button" aria-haspopup="true" aria-expanded="false">👤 <span class="lbl">' + esc(CX.name || (CX.role === 'admin' ? 'Teacher' : 'Student')) + '</span></button><div class="ucm" hidden><button type="button" class="lo">Sign out</button></div></div></div></header>'), document.body.firstChild);
+    '<div class="userchip"><button class="btn uc" type="button" aria-haspopup="true" aria-expanded="false">👤 <span class="lbl">' + esc(CX.name || (CX.role === 'admin' ? 'Teacher' : 'Student')) + '</span></button><div class="ucm" hidden>' + (CX.role === 'student' ? '<div class="small muted" style="padding:6px 10px">Student ID ' + esc(CX.username) + '</div><button type="button" class="cp">🔑 Change password</button>' : '') + '<button type="button" class="lo">Sign out</button></div></div></div></header>'), document.body.firstChild);
   var uc = $('.userchip .uc'), ucm = $('.userchip .ucm');
   uc.onclick = function (e) { e.stopPropagation(); ucm.hidden = !ucm.hidden; uc.setAttribute('aria-expanded', !ucm.hidden); };
   document.addEventListener('click', function () { ucm.hidden = true; uc.setAttribute('aria-expanded', 'false'); });
+  if ($('.userchip .cp')) $('.userchip .cp').onclick = function () { CX.changePassword(); };
   $('.userchip .lo').onclick = function () { if (HOOKS.beforeLogout && HOOKS.beforeLogout() === false) return; CX.logout(); };
   $$('.nav a').forEach(function (a) { navEls[a.dataset.k] = a; });
   $('.searchbox').addEventListener('submit', function (e) { e.preventDefault(); var v = $('#gsearch').value.trim(); if (v.length > 1) location.hash = '#/search/' + encodeURIComponent(v); });
   app = $('#app');
-  document.body.appendChild(h('<footer class="footer">' + esc(D.meta.title) + ' · ' + esc(D.meta.author) + ', ' + esc(D.meta.role) + ' · ' + esc(D.meta.dept) + '<br>Content: ' + esc(D.meta.contentNote) + ' Practice progress and results stay in this browser and are not official assessment results. Version ' + esc(APP_VERSION) + '.</footer>'));
+  document.body.appendChild(h('<footer class="footer">' + esc(D.meta.title) + ' · ' + esc(D.meta.author) + ', ' + esc(D.meta.role) + ' · ' + esc(D.meta.dept) + '<br>Content: ' + esc(D.meta.contentNote) + ' Your progress and results are saved to your account on the platform. Version ' + esc(APP_VERSION) + '.</footer>'));
 }
 function setNav(k) { Object.keys(navEls).forEach(function (x) { navEls[x].classList.toggle('active', x === k); if (x === k) navEls[x].setAttribute('aria-current', 'page'); else navEls[x].removeAttribute('aria-current'); }); }
 var cleanup = null;
@@ -231,10 +253,10 @@ function route() {
   var hsh = decodeURIComponent(location.hash.replace(/^#\/?/, '')), parts = hsh.split('/');
   var v = parts[0] || '';
   window.scrollTo(0, 0);
-  app.innerHTML = '';
+  app.innerHTML = ''; routeTok++;
   if (!STORAGE_OK) app.appendChild(h('<div class="note" style="margin-bottom:14px">This browser is blocking local storage (for example, a private window). You can use everything, but progress and results will be lost when the page closes.</div>'));
-  var cur = activeAttempts();
-  if (cur.length && v !== 'test') app.appendChild(h('<div class="note noprint" style="margin-bottom:14px">⏱ You have an assessment in progress: <a href="#/test/' + cur[0].test + '">return to ' + esc(D.tests[cur[0].test].title) + '</a>. The timer keeps running.</div>'));
+  var cur = activeAssessment();
+  if (cur && v !== 'test') app.appendChild(h('<div class="note noprint" style="margin-bottom:14px">⏱ You have an assessment in progress: <a href="#/test/' + esc(cur.id) + '">return to ' + esc(cur.title) + '</a>. The timer keeps running.</div>'));
   if (HOOKS.route && HOOKS.route(v, parts)) { setNav('faculty'); }
   else if (v === '' ) { setNav('home'); viewHome(); }
   else if (v === 'learn') { setNav('learn'); viewLearn(); }
@@ -248,83 +270,65 @@ function route() {
   else if (v === 'faculty') { setNav('faculty'); viewFaculty(); }
   else if (v === 'present') { setNav('faculty'); viewPresentHub(); if (parts[1]) startPresentation(+parts[1], parts[2] === 'edit'); }
   else if (v === 'search') { setNav(''); viewSearch(parts.slice(1).join('/')); }
-  else if (v === 'teacher') { setNav('faculty'); viewTeacher(); }
+  else if (v === 'teacher') { setNav('faculty'); viewTeacher(parts[1]); }
   else { setNav('home'); viewHome(); }
   var h1 = $('h1', app); if (h1) document.title = h1.textContent + ' — ' + D.meta.short;
   if (HOOKS.afterRender) HOOKS.afterRender(v, parts);
 }
 
-/* ---------------- progress state ---------------- */
+/* ---------------- progress state (server) ---------------- */
+// SV = this student's state from the backend (vulvaBootstrap): assessments, practice index, revision queue,
+// topic analysis and synced progress. Refreshed after practice and assessments.
+var SV = { assessments: [], practiceIndex: [], srs: {}, due: [], priorities: [], topics: [], progress: { practice: {} } }, svAt = 0, svBusy = null;
+function applyBootstrap(r) {
+  SV = r; SV.progress = SV.progress || {}; SV.progress.practice = SV.progress.practice || {}; svAt = Date.now();
+  // progress saved on the backend wins over this browser's copy for items it knows about
+  if (CX.role === 'student') {
+    [['studied', 'studied'], ['facts2', 'facts'], ['checks', 'checks']].forEach(function (k) { var srv = SV.progress[k[1]]; if (srv && Object.keys(srv).length) store.set(k[0], Object.assign(store.get(k[0], {}), srv), true); });
+    if (SV.progress.last && (!store.get('last', null) || SV.progress.last.at > store.get('last', {}).at)) store.set('last', SV.progress.last, true);
+  }
+  if (SECTIONS) reindex();
+}
+function refreshServer(force) {
+  if (svBusy) return svBusy;
+  if (!force && Date.now() - svAt < 60000) return Promise.resolve(SV);
+  svBusy = CX.api('vulvaBootstrap').then(function (r) { svBusy = null; if (r.ok) applyBootstrap(r); return SV; }, function () { svBusy = null; return SV; });
+  return svBusy;
+}
 function studied() { return store.get('studied', {}); }
 function lectureProgress(n) { var L = D.lectures[n - 1], st = studied(); var done = L.sections.filter(function (s) { return st[s.id]; }).length; return { done: done, total: L.sections.length }; }
-function attempts() { return store.get('attempts', []).map(normAttempt).filter(Boolean); }
-function activeAttempts() { return Object.keys(D.tests).map(function (t) { return store.get('cur_' + t, null); }).filter(Boolean); }
-function bestFor(test) { var a = attempts().filter(function (x) { return x.test === test; }); if (!a.length) return null; return a.reduce(function (b, x) { return x.pct > b.pct ? x : b; }); }
-function lastFor(test) { var a = attempts().filter(function (x) { return x.test === test; }); return a.length ? a[a.length - 1] : null; }
+function activeAssessment() { return (SV.assessments || []).filter(function (a) { return a.active; })[0] || null; }
 
 /* ---------------- activity, revision queue, priorities ---------------- */
 function touch(label, href) { store.set('last', { label: label, href: href, at: Date.now() }); }
-var SRS_DAYS = [0, 1, 3, 7, 14, 30];
-function srs() { return store.get('srs', {}); }
-function recordConcepts(results, source) {
-  // results: {concept: true/false}; wrong → due now (box 0); right → next box, later due date
-  var S = srs(), now = Date.now();
-  Object.keys(results).forEach(function (k) {
-    if (!CONCEPTS[k]) return;
-    var e = S[k] || { box: 0, n: 0, wrong: 0 };
-    e.n++; e.last = now; e.lastOk = !!results[k]; e.src = source || e.src;
-    if (results[k]) { if (!S[k]) { return; } e.box = Math.min(SRS_DAYS.length - 1, (e.box || 0) + 1); }
-    else { e.box = 0; e.wrong++; }
-    e.due = now + SRS_DAYS[e.box] * 86400000;
-    S[k] = e;
-  });
-  store.set('srs', S);
-}
-function dueConcepts() { var S = srs(), now = Date.now(); return Object.keys(S).filter(function (k) { return S[k].due <= now; }).sort(function (a, b) { return S[a].due - S[b].due; }); }
-function latestAttempts() { var latest = {}; attempts().forEach(function (a) { latest[a.test] = a; }); return Object.keys(latest).map(function (t) { return latest[t]; }); }
-function combinedByTopic(list) { var by = {}; list.forEach(function (a) { var bt = a.byTopic; Object.keys(bt).forEach(function (k) { by[k] = by[k] || [0, 0]; by[k][0] += bt[k][0]; by[k][1] += bt[k][1]; }); }); return by; }
-function priorities(list, n) {
-  // Revision priority = topics with missed questions, lowest score first (§18)
-  var rows = {};
-  list.forEach(function (a) {
-    attemptQs(a).forEach(function (q) {
-      var r = rows[q.topic] = rows[q.topic] || { topic: q.topic, right: 0, total: 0, missed: [], secs: {}, concepts: {}, attempts: {} };
-      r.total++;
-      if (isRight(a, q)) r.right++;
-      else { r.missed.push(q.id); r.secs[q.section] = 1; r.concepts[q.concept] = 1; r.attempts[a.id] = 1; }
-    });
-  });
-  return Object.keys(rows).map(function (k) { return rows[k]; }).filter(function (r) { return r.missed.length; })
-    .sort(function (a, b) { return a.right / a.total - b.right / b.total || b.missed.length - a.missed.length; }).slice(0, n || 3);
-}
+function dueConcepts() { var S = SV.srs || {}, now = Date.now(); return Object.keys(S).filter(function (k) { return S[k].due <= now; }).sort(function (a, b) { return S[a].due - S[b].due; }); }
+function topicName(k) { return D.topics[k] ? D.topics[k].name : k; }
+/** Revision priorities computed on the server from the latest attempt at each assessment. */
 function priorityCards(list, n) {
-  var P = priorities(list, n), box = h('<div class="prios"></div>');
-  if (!P.length) { box.appendChild(h('<p class="muted">No weak topic yet' + (list.length ? ' — every question in your latest attempts was correct.' : '. Take an assessment and your revision priorities will appear here.') + '</p>')); return box; }
+  var P = (list || []).slice(0, n || 3), box = h('<div class="prios"></div>');
+  if (!P.length) { box.appendChild(h('<p class="muted">No weak topic yet' + ((SV.assessments || []).some(function (a) { return a.attempts; }) ? ' — every question in your latest attempts was correct.' : '. Take an assessment and your revision priorities will appear here.') + '</p>')); return box; }
   P.forEach(function (r, i) {
-    var secs = Object.keys(r.secs).sort();
-    box.appendChild(h('<div class="prio-card"><div class="pn">Revision Priority ' + (i + 1) + '</div><h3>' + esc(D.topics[r.topic].name) + '</h3>' +
-      '<p class="small"><b>' + r.right + '/' + r.total + '</b> (' + pct(r.right, r.total) + '%) · <b>' + r.missed.length + '</b> missed</p>' +
-      '<p class="small">Review: ' + secs.map(function (x) { return '<a href="' + subLink(x) + '">' + esc(subTitle(x)) + '</a>'; }).join('; ') + '</p>' +
-      '<div class="row"><a class="btn" href="' + subLink(secs[0]) + '">📖 Review topic</a><a class="btn primary" href="#/practice/retry/' + encodeURIComponent(Object.keys(r.attempts).join(',')) + '/' + r.topic + '">🔁 Retry weak questions</a></div></div>'));
+    var secs = (r.sections || []).filter(Boolean);
+    box.appendChild(h('<div class="prio-card"><div class="pn">Revision Priority ' + (i + 1) + '</div><h3>' + esc(topicName(r.topic)) + '</h3>' +
+      '<p class="small"><b>' + r.questions_correct + '/' + r.questions_attempted + '</b> (' + r.score + '%) · <b>' + r.missed + '</b> missed</p>' +
+      (secs.length ? '<p class="small">Review: ' + secs.map(function (x) { return '<a href="' + subLink(x) + '">' + esc(subTitle(x)) + '</a>'; }).join('; ') + '</p>' : '') +
+      '<div class="row">' + (secs.length ? '<a class="btn" href="' + subLink(secs[0]) + '">📖 Review topic</a>' : '') + '<a class="btn primary" href="#/practice/retry/' + encodeURIComponent((r.attemptIds || []).join(',')) + '/' + encodeURIComponent(r.topic) + '">🔁 Retry weak questions</a></div></div>'));
   });
   return box;
 }
 function nextSection() { var st = studied(); for (var i = 0; i < ORDER.length; i++) if (!st[ORDER[i]] && SECTIONS[ORDER[i]].subs.length + (SECTIONS[ORDER[i]].intro ? 1 : 0)) return ORDER[i]; return null; }
 function nextAction() {
-  var cur = activeAttempts(); if (cur.length) return ['#/test/' + cur[0].test, 'Resume your ' + D.tests[cur[0].test].title, 'The timer is still running.'];
+  var act = activeAssessment(); if (act) return ['#/test/' + act.id, 'Resume ' + act.title, 'The timer is still running.'];
   var due = dueConcepts();
-  if (due.length && attempts().length) return ['#/progress/queue', 'Revise ' + due.length + ' concept(s) due for revision', 'Short targeted practice on what you missed.'];
+  if (due.length) return ['#/progress/queue', 'Revise ' + due.length + ' concept(s) due for revision', 'Short targeted practice on what you missed.'];
   for (var i = 0; i < D.lectures.length; i++) {
     var p = lectureProgress(i + 1);
-    if (p.done < p.total) { var ns = nextSection(); return [secLink(ns), 'Continue learning: ' + secTitle(ns), p.done + ' of ' + p.total + ' ' + D.lectures[i].title + ' sections studied.']; }
+    if (p.done < p.total) { var ns = nextSection(); if (ns) return [secLink(ns), 'Continue learning: ' + secTitle(ns), p.done + ' of ' + p.total + ' ' + D.lectures[i].title + ' sections studied.']; }
   }
-  var testKeys = Object.keys(D.tests);
-  for (var j = 0; j < testKeys.length; j++) {
-    var tk = testKeys[j];
-    if (!lastFor(tk)) return ['#/test/' + tk, 'Take the ' + D.tests[tk].title, (QBY[tk] || []).length + ' SBAs, ' + settings().minutes[tk] + ' minutes.'];
-  }
-  var P = priorities(latestAttempts(), 1);
-  if (P.length) return ['#/practice/retry/' + encodeURIComponent(Object.keys(P[0].attempts).join(',')) + '/' + P[0].topic, 'Retry your weak questions: ' + D.topics[P[0].topic].name, 'Your lowest-scoring topic in the latest attempts.'];
+  var todo = (SV.assessments || []).filter(function (a) { return a.canStart && !a.attempts; })[0];
+  if (todo) return ['#/test/' + todo.id, 'Take the ' + todo.title, todo.questionCount + ' questions, ' + todo.durationMin + ' minutes.'];
+  var P = SV.priorities || [];
+  if (P.length) return ['#/practice/retry/' + encodeURIComponent((P[0].attemptIds || []).join(',')) + '/' + encodeURIComponent(P[0].topic), 'Retry your weak questions: ' + topicName(P[0].topic), 'Your lowest-scoring topic in the latest attempts.'];
   return ['#/review', 'Last-minute review', 'Key facts, comparisons, traps and the 15-minute review.'];
 }
 
@@ -342,10 +346,11 @@ function viewHome() {
   g.appendChild(h('<div class="card"><h2 style="margin-top:0">📖 Continue learning</h2>' +
     D.lectures.map(function (L, i) { var pp = lectureProgress(i + 1); return '<div class="row small" style="margin:6px 0"><a href="#/lecture/' + L.num + '" style="min-width:90px"><b>' + esc(L.title) + '</b></a><span class="progress" style="flex:1" role="img" aria-label="' + pct(pp.done, pp.total) + '% studied"><i style="width:' + pct(pp.done, pp.total) + '%"></i></span><span>' + pp.done + '/' + pp.total + '</span></div>'; }).join('') +
     (ns ? '<a class="btn" href="' + secLink(ns) + '">Next: ' + esc(secTitle(ns)) + ' →</a>' : '<p class="small">✓ Every section is marked as studied.</p>') + '</div>'));
-  g.appendChild(h('<div class="card"><h2 style="margin-top:0">📝 Assessments</h2><table class="data"><tbody>' + Object.keys(D.tests).map(function (t) { var l = lastFor(t), b = bestFor(t); return '<tr><td><a href="#/test/' + t + '">' + esc(D.tests[t].title) + '</a></td><td>' + (l ? 'Last <b>' + l.pct + '%</b> · best ' + b.pct + '%' : '<span class="muted">Not attempted</span>') + '</td></tr>'; }).join('') + '</tbody></table></div>'));
+  var asm = SV.assessments || [];
+  g.appendChild(h('<div class="card"><h2 style="margin-top:0">📝 Assessments</h2>' + (asm.length ? '<table class="data"><tbody>' + asm.map(function (x) { return '<tr><td><a href="#/test/' + esc(x.id) + '">' + esc(x.title) + '</a></td><td>' + (x.last ? 'Last <b>' + x.last.percent + '%</b> · best ' + x.best + '%' : x.active ? '<span class="pill warn">in progress</span>' : '<span class="muted">Not attempted</span>') + '</td></tr>'; }).join('') + '</tbody></table>' : '<p class="muted">No assessment is open yet.</p>') + '</div>'));
   app.appendChild(g);
   var pr = h('<div class="card" style="margin-top:16px"><div class="row"><h2 style="margin:0">🎯 Top 3 revision priorities</h2><div class="spacer"></div><a class="small" href="#/progress">All results →</a></div><p class="small muted" style="margin:4px 0 10px">From your latest attempt at each assessment.</p></div>');
-  pr.appendChild(priorityCards(latestAttempts(), 3)); app.appendChild(pr);
+  pr.appendChild(priorityCards(SV.priorities, 3)); app.appendChild(pr);
   var due = dueConcepts();
   app.appendChild(h('<div class="grid g2" style="margin-top:16px"><div class="card"><h2 style="margin-top:0">🔁 Due for revision</h2><p>' + (due.length ? '<b>' + due.length + '</b> concept(s) are due. <a href="#/progress/queue">Open the revision queue →</a>' : 'Nothing is due. Concepts you miss in practice or assessments are added automatically.') + '</p></div>' +
     '<div class="card"><h2 style="margin-top:0">🕒 Last activity</h2><p>' + (last ? '<a href="' + esc(last.href) + '">' + esc(last.label) + '</a> <span class="small muted">· ' + fmtDate(last.at) + '</span>' : 'No activity recorded in this browser yet.') + '</p></div></div>'));
@@ -398,7 +403,7 @@ function viewLecture(n, target, sub2) {
     sec.appendChild(mb);
     main.appendChild(sec);
   });
-  if (n === D.lectures.length) { var tk0 = Object.keys(D.tests)[0]; main.appendChild(h('<div class="card"><h2 style="margin-top:0">⭐ Finished all the teaching sections?</h2><p>Take the <a href="#/test/' + tk0 + '">' + esc(D.tests[tk0].title) + '</a>, then finish with the <a href="#/review">Last-Minute Review</a> (key facts as active recall, plus traps and the 15-minute review).</p></div>')); }
+  if (n === D.lectures.length) { main.appendChild(h('<div class="card"><h2 style="margin-top:0">⭐ Finished all the teaching sections?</h2><p>Take an <a href="#/tests">assessment</a>, then finish with the <a href="#/review">Last-Minute Review</a> (key facts as active recall, plus traps and the 15-minute review).</p></div>')); }
   wrap.appendChild(toc); wrap.appendChild(main); app.appendChild(wrap);
   $('[data-a=expand]', main).onclick = function () { $$('details.sub', main).forEach(function (d) { d.open = true; }); };
   $('[data-a=collapse]', main).onclick = function () { $$('details.sub', main).forEach(function (d) { d.open = false; }); };
@@ -409,7 +414,7 @@ function viewLecture(n, target, sub2) {
 }
 function nextLink(n, id) {
   var i = ORDER.indexOf(id), nx = ORDER[i + 1];
-  if (!nx) { var tk1 = Object.keys(D.tests)[0]; return '<a class="btn primary" href="#/test/' + tk1 + '">Next: ' + esc(D.tests[tk1].title) + ' →</a>'; }
+  if (!nx) return '<a class="btn primary" href="#/tests">Next: the assessments →</a>';
   return '<a class="btn ghost" href="' + secLink(nx) + '">Next: ' + esc(secTitle(nx)) + ' →</a>';
 }
 function highlight(root, q) {
@@ -524,23 +529,31 @@ function renderCheck(c) {
   return box;
 }
 
-/* ---------------- PRACTICE (formative SBAs, retry, section checks) ---------------- */
-function pstate() { return store.get('pstate', {}); }
-function itemStemHtml(x) {
-  if (Array.isArray(x.stem)) return stemHtml(x);
-  return '<p>' + inl(x.stem) + '</p>' + (x.image ? figCard(x.image) : '');
+/* ---------------- PRACTICE (server question bank: answers are checked on the server) ---------------- */
+function pstate() { return (SV.progress && SV.progress.practice) || {}; }
+var ITEMS = {};   // practice questions already fetched: id → { id, stem[], image, options[], … } (no answers)
+function loadItems(ids) {
+  var need = ids.filter(function (id) { return !ITEMS[id]; });
+  if (!need.length) return Promise.resolve(ids.map(function (id) { return ITEMS[id]; }).filter(Boolean));
+  var chunks = []; for (var i = 0; i < need.length; i += 150) chunks.push(need.slice(i, i + 150));
+  return Promise.all(chunks.map(function (c) { return CX.api('vulvaPracticeItems', { ids: c }); })).then(function (rs) {
+    rs.forEach(function (r) { if (r.ok) r.items.forEach(function (it) { ITEMS[it.id] = it; }); else toast(r.error || 'Questions could not be loaded.'); });
+    return ids.map(function (id) { return ITEMS[id]; }).filter(Boolean);
+  });
 }
-function itemRef(x) { return x.ref || x.source || ''; }
-function itemSec(x) { return x.sub || x.section || (x.sections && x.sections[0]); }
+function stemParas(x) {
+  var parts = x.stem || [], mark = parts.indexOf('[[IMAGE]]') >= 0;
+  return parts.map(function (p) { return p === '[[IMAGE]]' ? (x.image ? figCard(x.image) : '') : '<p>' + inl(p) + '</p>'; }).join('') + (!mark && x.image ? figCard(x.image) : '');
+}
 function sbaCard(x, onDone, opts) {
   opts = opts || {};
-  var isQ = !!x.test, prev = !isQ && pstate()[x.id];
-  var el = h('<div class="sba" data-qid="' + esc(x.id) + '" data-bank="' + (isQ ? 'questions' : 'practice') + '"><div class="row small muted"><b style="color:var(--navy)">' + esc(isQ ? (x.code + ' · from ' + D.tests[x.test].title) : 'Practice ' + x.id) + '</b>' +
-    (x.previousExam ? '<span class="pill">previous-exam concept</span>' : '') + (opts.newItem ? '<span class="pill good">new question</span>' : '') +
+  var prev = pstate()[x.id];
+  var el = h('<div class="sba" data-qid="' + esc(x.id) + '" data-bank="practice"><div class="row small muted"><b style="color:var(--navy)">' + esc(x.kind === 'assess' ? (x.code || 'Assessment question') + ' · from an assessment' : 'Practice question') + '</b>' +
+    (x.past ? '<span class="pill">past paper: ' + esc(x.past) + '</span>' : x.previousExam ? '<span class="pill">previous-exam concept</span>' : '') + (opts.newItem ? '<span class="pill good">new question</span>' : '') +
     (prev ? '<span class="pill ' + (prev.ok ? 'good' : 'bad') + '">' + (prev.ok ? 'correct last time' : 'missed last time') + '</span>' : '') +
-    '</div><div class="stem md">' + itemStemHtml(x) + '</div><div class="opts" role="radiogroup" aria-label="Options"></div><div class="row"><button class="btn primary chk" type="button">Check answer</button></div><div class="fbx" aria-live="polite"></div></div>');
+    '</div><div class="stem md">' + stemParas(x) + '</div><div class="opts" role="radiogroup" aria-label="Options"></div><div class="row"><button class="btn primary chk" type="button">Check answer</button></div><div class="fbx" aria-live="polite"></div></div>');
   var og = $('.opts', el), sel = null, done = false;
-  x.options.forEach(function (o, i) {
+  (x.options || []).forEach(function (o, i) {
     var b = h('<button class="opt" type="button" role="radio" aria-checked="false"><span class="L">' + LETTERS[i] + '</span><span>' + inl(o) + '</span></button>');
     b.onclick = function () { if (done) return; sel = i; $$('.opt', og).forEach(function (y, j) { y.classList.toggle('sel', j === i); y.setAttribute('aria-checked', j === i); }); };
     og.appendChild(b);
@@ -548,71 +561,74 @@ function sbaCard(x, onDone, opts) {
   $('.chk', el).onclick = function () {
     if (done) return;
     if (sel == null) { toast('Choose an answer first.'); return; }
-    done = true;
-    var ok = sel === x.answer;
-    $$('.opt', og).forEach(function (y, j) { y.disabled = true; if (j === x.answer) y.classList.add('right'); else if (j === sel) y.classList.add('wrong'); });
-    $('.chk', el).remove();
-    var sec = itemSec(x);
-    $('.fbx', el).innerHTML = '<div class="fb ' + (ok ? 'good' : 'bad') + ' md"><p><span class="mark">' + (ok ? '✓ Correct.' : '✗ Not quite — the answer is ' + LETTERS[x.answer] + '.') + '</span> ' + inl(x.explanation) + '</p>' + (x.trap ? '<p><strong>Exam trap:</strong> ' + inl(x.trap) + '</p>' : '') +
-      '<p class="src">' + esc(itemRef(x)) + (sec ? ' · <a href="' + subLink(sec) + '">Review ' + esc(subTitle(sec)) + '</a>' : '') + '</p></div>';
-    if (!isQ) { var st = pstate(); st[x.id] = { ok: ok, at: Date.now() }; store.set('pstate', st); }
-    var r = {}; r[x.concept] = ok; recordConcepts(r, 'practice');
-    if (onDone) onDone(ok);
+    var btn = $('.chk', el); btn.disabled = true; btn.textContent = 'Checking…';
+    CX.api('vulvaPracticeCheck', { id: x.id, answer: sel }).then(function (r) {
+      if (!r.ok) { btn.disabled = false; btn.textContent = 'Check answer'; toast(r.error || 'The answer could not be checked.'); return; }
+      done = true; btn.remove();
+      $$('.opt', og).forEach(function (y, j) { y.disabled = true; if (j === r.answer) y.classList.add('right'); else if (j === sel) y.classList.add('wrong'); });
+      var sec = r.sub || r.section;
+      $('.fbx', el).innerHTML = '<div class="fb ' + (r.correct ? 'good' : 'bad') + ' md"><p><span class="mark">' + (r.correct ? '✓ Correct.' : '✗ Not quite — the answer is ' + LETTERS[r.answer] + '.') + '</span> ' + inl(r.explanation || '') + '</p>' + (r.trap ? '<p><strong>Exam trap:</strong> ' + inl(r.trap) + '</p>' : '') +
+        '<p class="src">' + esc(r.ref || '') + (sec && (SUBS[sec] || SECTIONS[sec]) ? ' · <a href="' + subLink(sec) + '">Review ' + esc(subTitle(sec)) + '</a>' : '') + '</p></div>';
+      if (CX.role === 'student') { SV.progress.practice[x.id] = { ok: r.correct, at: Date.now() }; svAt = 0; }
+      if (onDone) onDone(r.correct);
+    });
   };
   return el;
 }
 function testYourself(subId) {
   var items = PBY_SUB[subId] || [];
-  var d = h('<details class="ty noprint"><summary>🧠 Test yourself <span class="small muted">(' + items.length + ' question' + (items.length > 1 ? 's' : '') + ' · not sent to the teacher)</span></summary><div class="tyb"></div></details>');
-  d.addEventListener('toggle', function () { if (d.open && !d.dataset.r) { d.dataset.r = 1; items.forEach(function (x) { $('.tyb', d).appendChild(sbaCard(x)); }); } });
+  var d = h('<details class="ty noprint"><summary>🧠 Test yourself <span class="small muted">(' + items.length + ' question' + (items.length > 1 ? 's' : '') + ')</span></summary><div class="tyb"><p class="small muted">Loading…</p></div></details>');
+  d.addEventListener('toggle', function () {
+    if (!d.open || d.dataset.r) return; d.dataset.r = 1;
+    loadItems(items.map(function (x) { return x.id; })).then(function (list) { var b = $('.tyb', d); b.innerHTML = ''; list.forEach(function (x) { b.appendChild(sbaCard(x)); }); if (!list.length) b.innerHTML = '<p class="muted">No questions available.</p>'; });
+  });
   return d;
 }
+/** A practice run. `items` are full questions or index entries (fetched first). */
 function runSet(title, sub, items, opts) {
   opts = opts || {};
   app.appendChild(h('<div class="row"><div><div class="pill">' + esc(opts.kicker || 'Practice') + '</div><h1 style="margin-top:6px">' + esc(title) + '</h1>' + (sub ? '<p class="muted" style="margin:0">' + sub + '</p>' : '') + '</div><div class="spacer"></div><a class="btn" href="#/practice">← Practice</a></div>'));
   if (!items.length) { app.appendChild(h('<div class="card" style="margin-top:14px">' + (opts.empty || 'No questions here yet.') + '</div>')); return; }
-  var box = h('<div class="card runner" style="margin-top:14px"></div>'); app.appendChild(box);
-  var i = 0, res = [];
-  function draw() {
-    box.innerHTML = '';
-    if (i >= items.length) return summary();
-    box.appendChild(h('<div class="row small"><b>Question ' + (i + 1) + ' of ' + items.length + '</b><span class="progress" style="flex:1;max-width:260px" role="img" aria-label="progress"><i style="width:' + pct(i, items.length) + '%"></i></span><span class="muted">' + res.filter(Boolean).length + ' correct so far</span></div>'));
-    var card = sbaCard(items[i], function (ok) {
-      res[i] = ok;
-      var nx = h('<div class="row" style="margin-top:12px"><button class="btn primary" type="button">' + (i === items.length - 1 ? 'See summary' : 'Next question →') + '</button></div>');
-      $('button', nx).onclick = function () { i++; draw(); window.scrollTo(0, box.offsetTop - 80); };
-      card.appendChild(nx); $('button', nx).focus();
-    }, { newItem: opts.newIds && opts.newIds[items[i].id] });
-    box.appendChild(card);
+  var box = h('<div class="card runner" style="margin-top:14px"><p class="muted">Loading questions…</p></div>'); app.appendChild(box);
+  var host = app;
+  loadItems(items.map(function (x) { return x.id; })).then(function (list) { if (document.body.contains(box)) run(list); });
+  function run(list) {
+    items = list;
+    var i = 0, res = [];
+    function draw() {
+      box.innerHTML = '';
+      if (i >= items.length) return summary();
+      box.appendChild(h('<div class="row small"><b>Question ' + (i + 1) + ' of ' + items.length + '</b><span class="progress" style="flex:1;max-width:260px" role="img" aria-label="progress"><i style="width:' + pct(i, items.length) + '%"></i></span><span class="muted">' + res.filter(Boolean).length + ' correct so far</span></div>'));
+      var card = sbaCard(items[i], function (ok) {
+        res[i] = ok;
+        var nx = h('<div class="row" style="margin-top:12px"><button class="btn primary" type="button">' + (i === items.length - 1 ? 'See summary' : 'Next question →') + '</button></div>');
+        $('button', nx).onclick = function () { i++; draw(); window.scrollTo(0, box.offsetTop - 80); };
+        card.appendChild(nx); $('button', nx).focus();
+      }, { newItem: opts.newIds && opts.newIds[items[i].id] });
+      box.appendChild(card);
+    }
+    function summary() {
+      var right = res.filter(Boolean).length, missed = items.filter(function (x, k) { return !res[k]; });
+      var cons = {}; missed.forEach(function (x) { if (x.concept) cons[x.concept] = 1; });
+      box.appendChild(h('<h2 style="margin-top:0">Summary: ' + right + ' / ' + items.length + ' (' + pct(right, items.length) + '%)</h2>'));
+      if (!missed.length) box.appendChild(h('<p>✓ All correct. These concepts move further back in your revision queue.</p>'));
+      else box.appendChild(h('<div><p>Missed concepts (added to your <a href="#/progress/queue">revision queue</a>):</p><ul>' + Object.keys(cons).map(function (k) { return '<li><a href="' + conceptLink(k) + '">' + esc(conceptName(k)) + '</a></li>'; }).join('') + '</ul></div>'));
+      var r = h('<div class="row"><button class="btn" type="button">↺ Do this set again</button>' + (missed.length ? '<button class="btn primary" type="button">Retry only the ' + missed.length + ' missed</button>' : '') + '<a class="btn ghost" href="#/progress">My Progress →</a></div>');
+      var bs = $$('button', r);
+      bs[0].onclick = function () { i = 0; res = []; draw(); };
+      if (bs[1]) bs[1].onclick = function () { items = missed; i = 0; res = []; draw(); };
+      box.appendChild(r);
+      refreshServer(true);
+    }
+    draw();
   }
-  function summary() {
-    var right = res.filter(Boolean).length, missed = items.filter(function (x, k) { return !res[k]; });
-    var cons = {}; missed.forEach(function (x) { cons[x.concept] = 1; });
-    box.appendChild(h('<h2 style="margin-top:0">Summary: ' + right + ' / ' + items.length + ' (' + pct(right, items.length) + '%)</h2>'));
-    if (!missed.length) box.appendChild(h('<p>✓ All correct. These concepts move further back in your revision queue.</p>'));
-    else box.appendChild(h('<div><p>Missed concepts (added to your <a href="#/progress/queue">revision queue</a>):</p><ul>' + Object.keys(cons).map(function (k) { return '<li><a href="' + conceptLink(k) + '">' + esc(conceptName(k)) + '</a></li>'; }).join('') + '</ul></div>'));
-    var r = h('<div class="row"><button class="btn" type="button">↺ Do this set again</button>' + (missed.length ? '<button class="btn primary" type="button">Retry only the ' + missed.length + ' missed</button>' : '') + '<a class="btn ghost" href="#/progress">My Progress →</a></div>');
-    var bs = $$('button', r);
-    bs[0].onclick = function () { i = 0; res = []; draw(); };
-    if (bs[1]) bs[1].onclick = function () { items = missed; i = 0; res = []; draw(); };
-    box.appendChild(r);
-  }
-  draw();
+  void host;
 }
-function missedFrom(attemptIds, topic) {
-  var list = [], seen = {};
-  attemptIds.forEach(function (id) {
-    var a = attempts().filter(function (x) { return x.id === id; })[0]; if (!a) return;
-    attemptQs(a).forEach(function (q) { if (!isRight(a, q) && (!topic || q.topic === topic) && !seen[q.id]) { seen[q.id] = 1; list.push(q); } });
-  });
-  return list;
-}
+/** Up to `max` practice questions on these concepts (index entries), least-practised first. */
 function newOnConcepts(concepts, topic, max) {
-  // §19: 2–3 NEW questions on the same concepts (practice bank, never assessment items)
-  var out = [], seen = {}, st = pstate();
-  var pool = [];
+  var out = [], seen = {}, st = pstate(), pool = [];
   concepts.forEach(function (k) { (PBY_CONCEPT[k] || []).forEach(function (x) { pool.push(x); }); });
-  if (topic) PR.forEach(function (x) { if (SEC_TOPIC[x.section] === topic) pool.push(x); });
+  if (topic) PR.forEach(function (x) { if (secTopic(x) === topic) pool.push(x); });
   function rank(x) { var sx = st[x.id]; return (concepts.indexOf(x.concept) >= 0 ? 0 : 10) + (sx ? (sx.ok ? 2 : 1) : 0); }
   pool.sort(function (a, b) { return rank(a) - rank(b); });
   pool.forEach(function (x) { if (out.length < max && !seen[x.id]) { seen[x.id] = 1; out.push(x); } });
@@ -621,24 +637,27 @@ function newOnConcepts(concepts, topic, max) {
 function viewPractice(mode, args) {
   args = args || [];
   if (mode === 'retry') {
-    var ids = (args[0] || '').split(',').filter(Boolean), topic = args[1] || null;
-    if (!ids.length) ids = latestAttempts().map(function (a) { return a.id; });
-    var miss = missedFrom(ids, topic), cons = [];
-    miss.forEach(function (q) { if (cons.indexOf(q.concept) < 0) cons.push(q.concept); });
-    var fresh = miss.length ? newOnConcepts(cons, topic, 3) : [], nid = {}; fresh.forEach(function (x) { nid[x.id] = 1; });
-    touch('Retry my mistakes' + (topic ? ': ' + D.topics[topic].name : ''), location.hash);
-    return runSet(topic ? 'Retry weak questions: ' + D.topics[topic].name : 'Retry my mistakes', miss.length + ' question(s) you got wrong or left blank, plus ' + fresh.length + ' new question(s) on the same concepts. Answers are revealed only because the assessment was already submitted.', miss.concat(fresh), { kicker: 'Retry', newIds: nid, empty: 'No missed questions found for this selection. <a href="#/tests">Take an assessment</a> first.' });
+    var ids = (args[0] || '').split(',').filter(Boolean), topic = args[1] || '';
+    touch('Retry my mistakes' + (topic ? ': ' + topicName(topic) : ''), location.hash);
+    var hold = h('<div class="card">Preparing your questions…</div>'); app.appendChild(hold);
+    return CX.api('vulvaRetrySet', { attemptIds: ids, topic: topic }).then(function (r) {
+      if (!document.body.contains(hold)) return; hold.remove();
+      if (!r.ok) { app.appendChild(h('<div class="card err">' + esc(r.error || 'Your questions could not be loaded.') + '</div>')); return; }
+      r.missed.concat(r.fresh).forEach(function (it) { ITEMS[it.id] = it; });
+      var nid = {}; r.fresh.forEach(function (x) { nid[x.id] = 1; });
+      runSet(topic ? 'Retry weak questions: ' + topicName(topic) : 'Retry my mistakes', r.missed.length + ' question(s) you got wrong or left blank, plus ' + r.fresh.length + ' new question(s) on the same concepts.' + (r.hiddenUntilClose ? ' ' + r.hiddenUntilClose + ' more will be available when your teacher closes the assessment.' : ''), r.missed.concat(r.fresh), { kicker: 'Retry', newIds: nid, empty: 'No missed questions found. <a href="#/tests">Take an assessment</a> first.' });
+    });
   }
   if (mode === 'topic' && args[0] && D.topics[args[0]]) {
-    touch('Topic practice: ' + D.topics[args[0]].name, location.hash);
-    return runSet('Topic practice: ' + D.topics[args[0]].name, 'New single-best-answer questions written from the lectures (not the assessment questions).', PR.filter(function (x) { return SEC_TOPIC[x.section] === args[0]; }));
+    touch('Topic practice: ' + topicName(args[0]), location.hash);
+    return runSet('Topic practice: ' + topicName(args[0]), 'Single-best-answer questions written from the lectures (not the assessment questions).', PR.filter(function (x) { return secTopic(x) === args[0]; }));
   }
   if (mode === 'concept' && args[0]) {
     touch('Practice: ' + conceptName(args[0]), location.hash);
     return runSet(conceptName(args[0]), 'Practice questions on this concept. <a href="' + conceptLink(args[0]) + '">Review the learning block</a>.', PBY_CONCEPT[args[0]] || [], { empty: 'No practice question on this concept yet — <a href="' + conceptLink(args[0]) + '">review the learning block</a>.' });
   }
-  if (mode === 'prev') { touch('Previous-exam concepts', location.hash); return runSet('Previous-exam concepts', 'New questions that re-test concepts examined in previous papers (QZ, CQ, VR, VL references). They are not copies of the original questions.', PR.filter(function (x) { return x.previousExam; }), { kicker: 'Practice' }); }
-  if (mode === 'image') { touch('Morphology Challenge', location.hash); return runSet('Morphology Challenge', 'Identify the lesion from the embedded gross and microscopic images. Click any image to zoom.', PR.filter(function (x) { return x.image; })); }
+  if (mode === 'prev') { touch('Previous-exam concepts', location.hash); return runSet('Previous-exam concepts', 'Questions that re-test concepts examined in previous papers.', PR.filter(function (x) { return x.prev || x.past; }), { kicker: 'Practice' }); }
+  if (mode === 'image') { touch('Morphology Challenge', location.hash); return runSet('Morphology Challenge', 'Identify the lesion from the gross and microscopic images. Click any image to zoom.', PR.filter(function (x) { return x.img; })); }
   if (mode === 'queue') {
     var due = dueConcepts(), items = [];
     due.forEach(function (k) { var c = newOnConcepts([k], null, 1); if (c.length) items.push(c[0]); });
@@ -646,7 +665,7 @@ function viewPractice(mode, args) {
     return runSet('Due for revision', due.length + ' concept(s) due; one question each. Correct answers push a concept further back; wrong answers bring it back tomorrow.', items, { kicker: 'Revision queue', empty: 'Nothing is due. Missed concepts from practice and assessments are added automatically.' });
   }
   app.appendChild(h('<h1>Practice</h1>'));
-  app.appendChild(h('<p class="muted">Formative practice with instant feedback. Nothing here is sent to the teacher. Practice questions are separate from the assessment questions.</p>'));
+  app.appendChild(h('<p class="muted">Formative practice with instant feedback. Practice questions are separate from the assessment questions.</p>'));
   var tabs = h('<div class="tabs" role="tablist"><button data-f="home">Overview</button><button data-f="checks">Pathology Challenge</button><button data-f="mistakes">My mistakes</button><button data-f="weak">Retry weak topics</button></div>');
   var body = h('<div></div>'); app.appendChild(tabs); app.appendChild(body);
   function show(f) {
@@ -658,11 +677,11 @@ function viewPractice(mode, args) {
     var st = pstate(), done = Object.keys(st).length, ok = Object.keys(st).filter(function (k) { return st[k].ok; }).length;
     body.appendChild(h('<div class="grid g4" style="margin:4px 0 14px"><div class="card kpi"><div class="v">' + PR.length + '</div><div class="l">Practice questions</div></div><div class="card kpi"><div class="v">' + done + '</div><div class="l">Attempted</div></div><div class="card kpi"><div class="v">' + ok + '</div><div class="l">Correct at last try</div></div><div class="card kpi"><div class="v">' + dueConcepts().length + '</div><div class="l">Concepts due for revision</div></div></div>'));
     var g = h('<div class="grid g3"></div>');
-    [['#/practice/prev', '📜 Previous-exam concepts', PR.filter(function (x) { return x.previousExam; }).length + ' new questions on concepts examined before'], ['#/practice/image', '🔬 Morphology Challenge', PR.filter(function (x) { return x.image; }).length + ' image-based lesion-recognition questions'], ['#/progress/queue', '🔁 Due for revision', dueConcepts().length + ' concept(s) due now']].forEach(function (c) { g.appendChild(h('<a class="card step" href="' + c[0] + '"><div><h3>' + c[1] + '</h3><p class="small">' + esc(c[2]) + '</p></div></a>')); });
+    [['#/practice/prev', '📜 Previous-exam concepts', PR.filter(function (x) { return x.prev || x.past; }).length + ' questions on concepts examined before'], ['#/practice/image', '🔬 Morphology Challenge', PR.filter(function (x) { return x.img; }).length + ' image-based lesion-recognition questions'], ['#/progress/queue', '🔁 Due for revision', dueConcepts().length + ' concept(s) due now']].forEach(function (c) { g.appendChild(h('<a class="card step" href="' + c[0] + '"><div><h3>' + c[1] + '</h3><p class="small">' + esc(c[2]) + '</p></div></a>')); });
     body.appendChild(g);
     var t = h('<div class="card" style="margin-top:16px"><h2 style="margin-top:0">Topic practice</h2><div class="topics"></div></div>');
     Object.keys(D.topics).forEach(function (k) {
-      var its = PR.filter(function (x) { return SEC_TOPIC[x.section] === k; }); if (!its.length) return;
+      var its = PR.filter(function (x) { return secTopic(x) === k; }); if (!its.length) return;
       var ok2 = its.filter(function (x) { return st[x.id] && st[x.id].ok; }).length;
       $('.topics', t).appendChild(h('<a class="topic-row" href="#/practice/topic/' + k + '"><span>' + esc(D.topics[k].name) + '</span><span class="small muted">' + ok2 + '/' + its.length + ' correct</span></a>'));
     });
@@ -674,7 +693,7 @@ function viewPractice(mode, args) {
 function weakPanel() {
   var box = h('<div></div>');
   box.appendChild(h('<p class="muted">Your weakest topics from the latest attempt at each assessment. “Retry weak questions” gives you the questions you missed plus new questions on the same concepts.</p>'));
-  box.appendChild(priorityCards(latestAttempts(), 5));
+  box.appendChild(priorityCards(SV.priorities, 5));
   return box;
 }
 function checksPanel() {
@@ -703,293 +722,236 @@ function checksPanel() {
   return wrap;
 }
 function mistakesPanel() {
-  var box = h('<div></div>'), seen = {};
-  latestAttempts().forEach(function (a) {
-    attemptQs(a).forEach(function (q) { if (!isRight(a, q) && !seen[q.id]) seen[q.id] = { q: q, a: givenIdx(a, q), at: a }; });
-  });
-  var ids = Object.keys(seen), st = pstate(), pw = PR.filter(function (x) { return st[x.id] && !st[x.id].ok; });
-  box.appendChild(h('<div class="row"><p class="muted" style="flex:1;margin:0">Assessment questions you got wrong or left blank in your latest submitted attempts (' + ids.length + '), and practice questions you missed at your last try (' + pw.length + ').</p>' + (ids.length ? '<a class="btn primary" href="#/practice/retry">🔁 Retry my mistakes</a>' : '') + (pw.length ? '<button class="btn pwr" type="button">Retry missed practice (' + pw.length + ')</button>' : '') + '</div>'));
+  var box = h('<div></div>'), st = pstate(), pw = PR.filter(function (x) { return st[x.id] && !st[x.id].ok; });
+  var anyAttempt = (SV.assessments || []).some(function (a) { return a.attempts; });
+  box.appendChild(h('<div class="row"><p class="muted" style="flex:1;margin:0">Assessment questions you got wrong or left blank in your latest attempts, and practice questions you missed at your last try (' + pw.length + ').</p>' + (anyAttempt ? '<a class="btn primary" href="#/practice/retry">🔁 Retry my assessment mistakes</a>' : '') + (pw.length ? '<button class="btn pwr" type="button">Retry missed practice (' + pw.length + ')</button>' : '') + '</div>'));
   if (pw.length) $('.pwr', box).onclick = function () { app.innerHTML = ''; runSet('Missed practice questions', 'Practice questions you got wrong at your last try.', pw); };
-  if (!ids.length && !pw.length) box.appendChild(h('<div class="card" style="margin-top:10px">No mistakes recorded yet.</div>'));
-  ids.forEach(function (id) { var x = seen[id]; var c = h('<div class="card" style="margin:10px 0"></div>'); c.appendChild(reviewItem(x.q, x.a, true)); box.appendChild(c); });
+  if (!anyAttempt && !pw.length) box.appendChild(h('<div class="card" style="margin-top:10px">No mistakes recorded yet.</div>'));
   return box;
 }
 
-/* ---------------- QUESTIONS ---------------- */
-function stemHtml(q) {
-  return q.stem.map(function (p) { return p === '[[IMAGE]]' ? figCard(q.image) : '<p>' + inl(p) + '</p>'; }).join('');
-}
-function reviewItem(q, given, showTopic) {
-  var ok = given === q.answer;
-  var el = h('<div class="q" data-qid="' + esc(q.id) + '" data-bank="questions"><div class="row small muted"><b style="color:var(--navy)">' + esc(q.code) + '</b>' + (showTopic ? '<span>· ' + esc(D.topics[q.topic].name) + '</span>' : '') + '<span>· ' + esc(q.difficulty) + '</span>' + '<span class="pill ' + (given == null ? 'warn' : ok ? 'good' : 'bad') + '">' + (given == null ? 'Unanswered' : ok ? 'Correct' : 'Incorrect') + '</span></div><div class="stem md">' + stemHtml(q) + '</div><div class="opts"></div><div class="fb ' + (ok ? 'good' : 'bad') + ' md"></div></div>');
-  var og = $('.opts', el);
-  q.options.forEach(function (o, i) {
-    var cls = i === q.answer ? 'right' : i === given ? 'wrong' : '';
-    og.appendChild(h('<div class="opt ' + cls + '"><span class="L">' + LETTERS[i] + '</span><span>' + inl(o) + (i === given ? ' <span class="small muted">(your answer)</span>' : '') + '</span></div>'));
-  });
-  $('.fb', el).innerHTML = '<p><span class="mark">Answer: ' + LETTERS[q.answer] + '.</span> ' + inl(q.explanation) + '</p>' + (q.trap ? '<p><strong>Exam trap:</strong> ' + inl(q.trap) + '</p>' : '') + '<p class="small"><b>Learning objective:</b> ' + esc(q.objective) + '</p><p class="src">' + esc(q.source) + ' · <a href="' + secLink(q.sections[0]) + '">Revise section ' + esc(q.sections[0]) + '</a> · <a href="#/practice/concept/' + q.concept + '">Practise this concept</a></p>';
-  return el;
-}
-
-/* ---------------- ASSESSMENTS ---------------- */
-/* An attempt identifies questions and options by their permanent ids — a.qids (the paper as it was taken) and
-   a.answers = { questionId: optionId } — never by position. Editing, reordering, adding or removing questions or
-   answer options later cannot change how a saved attempt is read. */
-function attemptQs(a) { return (a.qids || []).map(function (id) { return QID[id]; }).filter(Boolean); }
-function givenIdx(a, q) { var o = a.answers[q.id]; return o == null ? null : (q.optionIds || []).indexOf(o); } // -1 = option since removed
-function isRight(a, q) { var o = a.answers[q.id]; return o != null && o === q.optionIds[q.answer]; }
-function answeredN(a) { return attemptQs(a).filter(function (q) { return a.answers[q.id] != null; }).length; }
-function normAttempt(a) {
-  // Result files from the original single-file edition stored answers by position; read them with the
-  // question order and option ids that edition used (kept in D.legacy).
-  if (!a || !Array.isArray(a.answers)) return a;
-  var order = ((D.legacy || {}).questionOrder || {})[a.test] || [];
-  if (order.length !== a.answers.length) return null;
-  var ans = {}; a.answers.forEach(function (x, i) { if (x != null) ans[order[i]] = 'o' + (x + 1); });
-  return Object.assign({}, a, { qids: order.slice(), answers: ans, legacyAnswers: a.answers, flags: [] });
-}
+/* ---------------- ASSESSMENTS (papers, timing and grading on the server) ---------------- */
 function viewTests() {
   app.appendChild(h('<h1>Assessments</h1>'));
-  app.appendChild(h('<p class="muted">Formal, timed single-best-answer papers. Answers and explanations are shown only after you submit. You may retake them; every attempt is saved in this browser and can be sent to your teacher.</p>'));
-  app.appendChild(h('<div class="note" style="margin-bottom:14px"><b>Formative revision and practice — not a secure high-stakes examination system.</b> Results are kept in this browser, and the shared class login does not identify individual students. Official examinations need server-side delivery and scoring with authenticated users.</div>'));
+  app.appendChild(h('<p class="muted">Timed single-best-answer papers. Your answers are saved on the platform as you go and graded by the platform when you submit.</p>'));
+  var list = SV.assessments || [];
+  if (!list.length) { app.appendChild(h('<div class="card">No assessment is open at the moment.</div>')); return; }
   var g = h('<div class="grid g3"></div>');
-  Object.keys(D.tests).forEach(function (t) {
-    var T = D.tests[t], last = lastFor(t), best = bestFor(t), cur = store.get('cur_' + t, null);
-    g.appendChild(h('<div class="card"><div class="pill">' + QBY[t].length + ' questions · ' + settings().minutes[t] + ' min</div><h2 style="margin:8px 0 4px">' + esc(T.title) + '</h2><p class="muted" style="margin-top:0">' + esc(T.sub) + '</p>' +
-      '<p class="small">' + (last ? 'Last: <b>' + last.pct + '%</b> (' + fmtDate(last.submittedAt) + ')<br>Best: <b>' + best.pct + '%</b> · ' + attempts().filter(function (a) { return a.test === t; }).length + ' attempt(s)' : 'Not attempted yet') + '</p>' +
-      '<div class="row"><a class="btn primary" href="#/test/' + t + '">' + (cur ? 'Resume' : last ? 'Retake' : 'Start') + '</a>' + (last ? '<a class="btn" href="#/result/' + last.id + '">Last result</a>' : '') + '</div></div>'));
+  list.forEach(function (a) {
+    var left = a.attemptsAllowed ? Math.max(0, a.attemptsAllowed - a.attempts) : null;
+    g.appendChild(h('<div class="card"><div class="pill">' + a.questionCount + ' questions · ' + a.durationMin + ' min</div><h2 style="margin:8px 0 4px">' + esc(a.title) + '</h2><p class="muted" style="margin-top:0">' + esc(a.subtitle || '') + '</p>' +
+      '<p class="small">' + (a.last ? 'Last: <b>' + a.last.percent + '%</b> (' + fmtDate(a.last.submittedAt) + ')<br>Best: <b>' + a.best + '%</b> · ' + a.attempts + ' attempt(s)' : 'Not attempted yet') + (left !== null ? '<br>' + left + ' attempt(s) left' : '') + (a.status === 'closed' ? '<br><span class="pill">closed</span>' : '') + '</p>' +
+      '<div class="row">' + (a.canStart ? '<a class="btn primary" href="#/test/' + esc(a.id) + '">' + (a.active ? 'Resume' : a.attempts ? 'Retake' : 'Start') + '</a>' : '') + (a.last ? '<a class="btn" href="#/result/' + esc(a.last.id) + '">Last result</a>' : '') + '</div></div>'));
   });
   app.appendChild(g);
 }
-function newAttempt(t, name, sid, email) {
-  var now = Date.now();
-  return { id: uid(t), test: t, name: name, studentId: sid, email: email, startedAt: now, deadline: now + settings().minutes[t] * 60000, qids: QBY[t].map(function (q) { return q.id; }), answers: {}, flags: [], cur: 0, v: APP_VERSION };
-}
-function viewTest(t) {
-  var T = D.tests[t]; if (!T) { location.hash = '#/tests'; return; }
-  var cur = store.get('cur_' + t, null);
-  if (cur && Date.now() > cur.deadline) { submitAttempt(t, true); return; }
-  if (!cur) return testGate(t);
-  runExam(t);
-}
-function testGate(t) {
-  var T = D.tests[t], prof = store.get('profile', {});
-  var c = h('<div class="card" style="max-width:660px;margin:0 auto"><div class="pill">' + QBY[t].length + ' questions · ' + settings().minutes[t] + ' minutes</div><h1 style="margin-top:8px">' + esc(T.title) + '</h1><p class="muted">' + esc(T.sub) + '</p>' +
-    '<ul class="small"><li>Single best answer. Letter keys (A, B, C…) answer; ← → move between questions.</li><li>Answers and explanations are <b>not</b> shown until you submit.</li><li>The timer keeps running if you leave the page; the paper is submitted automatically when time runs out.</li><li>Your result is saved in this browser. Download the result file afterwards if your teacher asks for it.</li></ul>' +
-    '<form novalidate><div class="grid g2"><div class="field"><label for="tn">Full name <span aria-hidden="true">*</span></label><input id="tn" required autocomplete="name" value="' + esc(prof.name || '') + '"><span class="err" id="tn-e" aria-live="polite"></span></div>' +
-    '<div class="field"><label for="ti">Student ID <span aria-hidden="true">*</span></label><input id="ti" required autocomplete="off" value="' + esc(prof.studentId || '') + '"><span class="err" id="ti-e" aria-live="polite"></span></div></div>' +
-    '<div class="field"><label for="te">Email address <span class="muted">(optional)</span></label><input id="te" type="email" autocomplete="email" value="' + esc(prof.email || '') + '" aria-describedby="te-h"><span class="small muted" id="te-h">Only so your teacher can contact you about this result. It is not used to verify who you are.</span><span class="err" id="te-e" aria-live="polite"></span></div>' +
-    '<p class="small muted">Name and Student ID label your result for the teacher. The platform cannot verify identity (shared class login): <b>formative revision and practice — not a secure high-stakes examination system.</b></p>' +
-    '<button class="btn primary" type="submit" style="margin-top:6px">Start the assessment</button></form></div>');
-  $('form', c).onsubmit = function (e) {
-    e.preventDefault();
-    var n = $('#tn').value.trim().replace(/\s+/g, ' '), sid = $('#ti').value.trim(), m = $('#te').value.trim(), bad = false;
-    $('#tn-e').textContent = n.length < 3 ? 'Please enter your full name.' : ''; if (n.length < 3) bad = true;
-    var oki = /^[A-Za-z0-9][A-Za-z0-9\-\/ ]{1,29}$/.test(sid);
-    $('#ti-e').textContent = oki ? '' : 'Please enter your Student ID (letters and numbers).'; if (!oki) bad = true;
-    var okm = !m || /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(m);
-    $('#te-e').textContent = okm ? '' : 'This email address does not look valid (or leave it empty).'; if (!okm) bad = true;
-    if (bad) { var f = $('.err:not(:empty)', c); if (f && f.previousElementSibling) f.previousElementSibling.focus(); return; }
-    store.set('profile', { name: n, studentId: sid, email: m });
-    store.set('cur_' + t, newAttempt(t, n, sid, m));
-    touch(D.tests[t].title, '#/test/' + t);
-    route();
-  };
+function viewTest(id) {
+  var a = (SV.assessments || []).filter(function (x) { return x.id === id; })[0];
+  if (!a) { app.appendChild(h('<div class="card">This assessment is not available. <a href="#/tests">All assessments</a></div>')); return; }
+  if (a.active) return startExam(a);
+  if (!a.canStart) { app.appendChild(h('<div class="card">' + (CX.role !== 'student' ? 'Teachers can preview the questions in Faculty tools → Question banks; assessments are taken by students.' : 'You cannot start this assessment (closed, or no attempts left).') + ' <a href="#/tests">All assessments</a></div>')); return; }
+  var c = h('<div class="card" style="max-width:660px;margin:0 auto"><div class="pill">' + a.questionCount + ' questions · ' + a.durationMin + ' minutes</div><h1 style="margin-top:8px">' + esc(a.title) + '</h1><p class="muted">' + esc(a.subtitle || '') + '</p>' +
+    '<ul class="small"><li>Single best answer. Letter keys (A, B, C, D) answer; ← → move between questions.</li><li>Your answers are saved on the platform as you go — if your connection drops or you close the page, sign in again and resume.</li><li>The timer is kept by the platform and keeps running if you leave; when time is up your saved answers are submitted automatically.</li>' + (a.attemptsAllowed ? '<li>You have ' + Math.max(0, a.attemptsAllowed - a.attempts) + ' attempt(s) left.</li>' : '') + '</ul>' +
+    '<button class="btn primary go" type="button" style="margin-top:6px">Start the assessment</button></div>');
+  $('.go', c).onclick = function () { startExam(a, $('.go', c)); };
   app.appendChild(c);
 }
-function runExam(t) {
-  var T = D.tests[t];
-  var A = normAttempt(store.get('cur_' + t, null)), qs = attemptQs(A);
-  A.cur = Math.min(A.cur || 0, Math.max(0, qs.length - 1));
-  function save() { store.set('cur_' + t, A); }
-  var wrap = h('<div class="exam"><div><div class="card"><div class="row"><div><div class="small muted">' + esc(T.title) + ' · ' + esc(A.name) + (A.studentId ? ' (' + esc(A.studentId) + ')' : '') + '</div><div class="qcount" style="font-weight:700;color:var(--navy)"></div></div><div class="spacer"></div><button class="btn flagb" type="button">⚑ Flag</button></div><div class="qbody"></div><div class="row" style="margin-top:14px"><button class="btn prev">← Previous</button><button class="btn clear ghost">Clear answer</button><div class="spacer"></div><button class="btn primary next">Next →</button></div></div></div>' +
-    '<aside class="card exam-side"><div class="small muted">Time remaining</div><div class="timer" aria-live="off">--:--</div><div class="progress" style="margin:8px 0"><i class="tp"></i></div><div class="small ansd"></div><div class="qnav" aria-label="Question navigator"></div><div class="legend"><span><i style="background:var(--teal)"></i>answered</span><span><i style="background:#fff;border:1px solid #ccc"></i>blank</span><span><i style="background:#f0b429;border-radius:50%"></i>flagged</span></div><button class="btn primary submit" style="width:100%;justify-content:center;margin-top:14px">Submit paper</button></aside></div>');
+function startExam(a, btn) {
+  if (btn) { btn.disabled = true; btn.textContent = 'Starting…'; }
+  CX.api('vulvaStart', { assessmentId: a.id }).then(function (r) {
+    if (!r.ok) { if (btn) { btn.disabled = false; btn.textContent = 'Start the assessment'; } toast(r.error || 'The assessment could not be started.'); return; }
+    touch(a.title, '#/test/' + a.id);
+    app.innerHTML = ''; runExam(r.attempt);
+  });
+}
+function runExam(att) {
+  var qs = att.paper, skew = att.serverTime - Date.now(), ans = {}, dirty = false, saving = false, curI = 0, finished = false;
+  Object.keys(att.responses || {}).forEach(function (k) { ans[k] = att.responses[k]; });
+  var local = store.get('exam_' + att.id, null); if (local && local.at > (att.serverTime || 0) - 5000) { Object.keys(local.ans || {}).forEach(function (k) { ans[k] = local.ans[k]; }); dirty = true; }
+  var wrap = h('<div class="exam"><div><div class="card"><div class="row"><div><div class="small muted">' + esc(att.title) + ' · ' + esc(CX.name || '') + '</div><div class="qcount" style="font-weight:700;color:var(--navy)"></div></div><div class="spacer"></div><button class="btn flagb" type="button">⚑ Flag</button></div><div class="qbody"></div><div class="row" style="margin-top:14px"><button class="btn prev">← Previous</button><button class="btn clear ghost">Clear answer</button><div class="spacer"></div><button class="btn primary next">Next →</button></div></div></div>' +
+    '<aside class="card exam-side"><div class="small muted">Time remaining</div><div class="timer" aria-live="off">--:--</div><div class="progress" style="margin:8px 0"><i class="tp"></i></div><div class="small ansd"></div><div class="small muted svst" aria-live="polite"></div><div class="qnav" aria-label="Question navigator"></div><div class="legend"><span><i style="background:var(--teal)"></i>answered</span><span><i style="background:#fff;border:1px solid #ccc"></i>blank</span><span><i style="background:#f0b429;border-radius:50%"></i>flagged</span></div><button class="btn primary submit" style="width:100%;justify-content:center;margin-top:14px">Submit paper</button></aside></div>');
   app.appendChild(wrap);
+  var flags = store.get('flags_' + att.id, []);
   var qnav = $('.qnav', wrap);
-  qs.forEach(function (q, i) { var b = h('<button type="button" aria-label="Question ' + (i + 1) + '">' + (i + 1) + '</button>'); b.onclick = function () { A.cur = i; save(); draw(); }; qnav.appendChild(b); });
+  qs.forEach(function (q, i) { var b = h('<button type="button" aria-label="Question ' + (i + 1) + '">' + (i + 1) + '</button>'); b.onclick = function () { curI = i; draw(); }; qnav.appendChild(b); });
+  function remember() { store.set('exam_' + att.id, { ans: ans, at: Date.now() }); dirty = true; saveSoon(); }
+  var saveT = null;
+  function saveSoon() { clearTimeout(saveT); saveT = setTimeout(saveNow, 2500); }
+  function saveNow() {
+    if (!dirty || saving || finished) return Promise.resolve();
+    saving = true; dirty = false; $('.svst', wrap).textContent = 'Saving…';
+    return CX.api('vulvaSave', { attemptId: att.id, responses: ans }).then(function (r) {
+      saving = false;
+      if (r.ok) { $('.svst', wrap).textContent = '✓ Answers saved ' + new Date().toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' }); skew = r.serverTime - Date.now(); return; }
+      if (r.code === 'expired' || r.code === 'final') { finished = true; stop(); toast(r.error); location.hash = '#/result/' + att.id; return; }
+      dirty = true; $('.svst', wrap).textContent = '⚠ Not saved yet — will retry (' + (r.error || 'connection') + ')';
+    });
+  }
   function draw() {
-    var i = A.cur, q = qs[i];
+    var i = curI, q = qs[i];
     $('.qcount', wrap).textContent = 'Question ' + (i + 1) + ' of ' + qs.length;
     var body = $('.qbody', wrap);
-    body.innerHTML = '<div class="q"><div class="stem md">' + stemHtml(q) + '</div><div class="opts" role="radiogroup" aria-label="Options"></div></div>';
+    body.innerHTML = '<div class="q"><div class="stem md">' + stemParas(q) + '</div><div class="opts" role="radiogroup" aria-label="Options"></div></div>';
     var og = $('.opts', body);
     q.options.forEach(function (o, j) {
-      var on = A.answers[q.id] === q.optionIds[j];
+      var on = ans[i] === j;
       var b = h('<button class="opt' + (on ? ' sel' : '') + '" type="button" role="radio" aria-checked="' + on + '"><span class="L">' + LETTERS[j] + '</span><span>' + inl(o) + '</span></button>');
-      b.onclick = function () { A.answers[q.id] = q.optionIds[j]; save(); draw(); };
+      b.onclick = function () { ans[i] = j; remember(); draw(); };
       og.appendChild(b);
     });
-    $('.flagb', wrap).textContent = A.flags.indexOf(q.id) >= 0 ? '⚑ Flagged' : '⚑ Flag';
+    $('.flagb', wrap).textContent = flags.indexOf(i) >= 0 ? '⚑ Flagged' : '⚑ Flag';
     $('.prev', wrap).disabled = i === 0; $('.next', wrap).textContent = i === qs.length - 1 ? 'Review & submit' : 'Next →';
-    $$('button', qnav).forEach(function (b, j) { b.classList.toggle('ans', A.answers[qs[j].id] != null); b.classList.toggle('cur', j === i); b.classList.toggle('flag', A.flags.indexOf(qs[j].id) >= 0); });
-    var n = answeredN(A);
-    $('.ansd', wrap).textContent = n + ' of ' + qs.length + ' answered';
+    $$('button', qnav).forEach(function (b, j) { b.classList.toggle('ans', ans[j] != null); b.classList.toggle('cur', j === i); b.classList.toggle('flag', flags.indexOf(j) >= 0); });
+    $('.ansd', wrap).textContent = Object.keys(ans).length + ' of ' + qs.length + ' answered';
   }
-  $('.prev', wrap).onclick = function () { if (A.cur > 0) { A.cur--; save(); draw(); } };
-  $('.next', wrap).onclick = function () { if (A.cur < qs.length - 1) { A.cur++; save(); draw(); } else confirmSubmit(); };
-  $('.clear', wrap).onclick = function () { delete A.answers[qs[A.cur].id]; save(); draw(); };
-  $('.flagb', wrap).onclick = function () { var id = qs[A.cur].id, k = A.flags.indexOf(id); if (k >= 0) A.flags.splice(k, 1); else A.flags.push(id); save(); draw(); };
+  $('.prev', wrap).onclick = function () { if (curI > 0) { curI--; draw(); } };
+  $('.next', wrap).onclick = function () { if (curI < qs.length - 1) { curI++; draw(); } else confirmSubmit(); };
+  $('.clear', wrap).onclick = function () { delete ans[curI]; remember(); draw(); };
+  $('.flagb', wrap).onclick = function () { var k = flags.indexOf(curI); if (k >= 0) flags.splice(k, 1); else flags.push(curI); store.set('flags_' + att.id, flags); draw(); };
   function confirmSubmit() {
-    var blank = qs.length - answeredN(A), fl = A.flags.length;
-    confirmBox('Submit your paper?', (blank ? blank + ' question(s) are unanswered. ' : 'All questions answered. ') + (fl ? fl + ' question(s) are flagged. ' : '') + 'After submission you will see your score, the answers and the explanations. You cannot change your answers after this.', 'Submit now', function () { submitAttempt(t, false); });
+    var blank = qs.length - Object.keys(ans).length, fl = flags.length;
+    confirmBox('Submit your paper?', (blank ? blank + ' question(s) are unanswered. ' : 'All questions answered. ') + (fl ? fl + ' question(s) are flagged. ' : '') + 'After submission you will see your score. You cannot change your answers after this.', 'Submit now', function () { submit(false); });
+  }
+  function submit(auto) {
+    if (finished) return; finished = true; stop();
+    $('.submit', wrap).disabled = true; $('.svst', wrap).textContent = 'Submitting…';
+    var key = 'sk_' + att.id;
+    CX.api('vulvaSubmit', { attemptId: att.id, responses: ans, submitKey: key }).then(function (r) {
+      if (!r.ok) {
+        if (r.code === 'expired' || r.code === 'final') { store.del('exam_' + att.id); svAt = 0; refreshServer(true); location.hash = '#/result/' + att.id; return; }
+        $('.svst', wrap).textContent = '⚠ Not submitted yet';
+        modal('Submission not yet confirmed', '<p class="err"><b>' + esc(r.error || 'Your paper could not be submitted.') + '</b></p><p>Your answers are kept on this device. Check your connection and press <b>Try again</b>. Submitting again is safe — the platform records only one submission.</p>',
+          [{ label: 'Try again', cls: 'primary', onClick: function () { finished = false; setTimeout(function () { submit(auto); }, 0); } }]);
+        return;
+      }
+      store.del('exam_' + att.id); store.del('flags_' + att.id);
+      RESULTS[att.id] = r.result; svAt = 0; refreshServer(true);
+      if (auto || r.expired) toast('Time is up — your paper has been submitted.');
+      location.hash = '#/result/' + att.id;
+    });
   }
   $('.submit', wrap).onclick = confirmSubmit;
+  var iv = null, sv = null;
   function tick() {
-    var left = (A.deadline - Date.now()) / 1000, tot = settings().minutes[t] * 60;
+    var left = (att.deadlineAt - (Date.now() + skew)) / 1000, tot = att.durationMin * 60;
     var tm = $('.timer', wrap); if (!tm) return;
     tm.textContent = fmtDur(left); tm.classList.toggle('low', left < 300);
     $('.tp', wrap).style.width = Math.max(0, 100 * left / tot) + '%';
-    if (left <= 0) { clearInterval(iv); toast('Time is up — your paper has been submitted.'); submitAttempt(t, true); }
+    if (left <= 0) submit(true);
   }
-  var iv = setInterval(tick, 1000); tick(); draw();
+  function start() { iv = setInterval(tick, 1000); sv = setInterval(function () { if (dirty) saveNow(); }, 20000); }
+  function stop() { clearInterval(iv); clearInterval(sv); clearTimeout(saveT); }
+  start(); tick(); draw();
+  if (dirty) saveSoon();
   function onKey(e) {
     if (document.querySelector('.modal-bg') || /INPUT|SELECT|TEXTAREA/.test((e.target || {}).tagName)) return;
-    var k = e.key.toUpperCase();
-    var q = qs[A.cur], j = LETTERS.indexOf(k);
-    if (k.length === 1 && j >= 0 && j < q.options.length) { A.answers[q.id] = q.optionIds[j]; save(); draw(); }
-    else if (e.key === 'ArrowRight' && A.cur < qs.length - 1) { A.cur++; save(); draw(); }
-    else if (e.key === 'ArrowLeft' && A.cur > 0) { A.cur--; save(); draw(); }
+    var k = e.key.toUpperCase(), q = qs[curI], j = LETTERS.indexOf(k);
+    if (k.length === 1 && j >= 0 && j < q.options.length) { ans[curI] = j; remember(); draw(); }
+    else if (e.key === 'ArrowRight' && curI < qs.length - 1) { curI++; draw(); }
+    else if (e.key === 'ArrowLeft' && curI > 0) { curI--; draw(); }
   }
-  document.addEventListener('keydown', onKey);
-  cleanup = function () { clearInterval(iv); document.removeEventListener('keydown', onKey); };
+  function onUnload() { if (dirty && !finished) CX.api('vulvaSave', { attemptId: att.id, responses: ans }, { keepalive: true }); }
+  document.addEventListener('keydown', onKey); window.addEventListener('pagehide', onUnload);
+  cleanup = function () { stop(); if (dirty && !finished) saveNow(); document.removeEventListener('keydown', onKey); window.removeEventListener('pagehide', onUnload); };
 }
-function gradeAttempt(a) {
-  var qs = attemptQs(a), c = 0, w = 0, u = 0, by = {};
-  qs.forEach(function (q) {
-    var t = by[q.topic] = by[q.topic] || [0, 0]; t[1]++;
-    if (a.answers[q.id] == null) u++; else if (isRight(a, q)) { c++; t[0]++; } else w++;
-  });
-  return { score: c, total: qs.length, pct: pct(c, qs.length), correct: c, incorrect: w, unanswered: u, byTopic: by };
-}
-function sigPayload(a) {
-  if (a.sigv === 3) return ['vulva-review-v3', a.id, a.test, a.name, a.studentId || '', a.email || '', a.startedAt, a.submittedAt, a.qids.map(function (id) { return id + '=' + (a.answers[id] || '-'); }).join(','), a.score].join('|');
-  var ans = (a.legacyAnswers || a.answers).map(function (x) { return x == null ? '-' : x; }).join('');
-  if (a.sigv === 2) return ['vulva-review-v2', a.id, a.test, a.name, a.studentId || '', a.email || '', a.startedAt, a.submittedAt, ans, a.score].join('|');
-  return ['vulva-review-v1', a.id, a.test, a.name, a.email, a.startedAt, a.submittedAt, ans, a.score].join('|');
-}
-function submitAttempt(t, auto) {
-  var A = normAttempt(store.get('cur_' + t, null)); if (!A) { location.hash = '#/tests'; return; }
-  var now = Date.now();
-  var g = gradeAttempt(A);
-  var rec = { id: A.id, test: t, name: A.name, studentId: A.studentId || '', email: A.email || '', sigv: 3, qids: A.qids, startedAt: A.startedAt, submittedAt: Math.min(now, A.deadline + 5000), durationSec: Math.round((Math.min(now, A.deadline) - A.startedAt) / 1000),
-    answers: A.answers, auto: !!auto, v: APP_VERSION };
-  Object.keys(g).forEach(function (k) { rec[k] = g[k]; });
-  sha256(sigPayload(rec)).then(function (sig) {
-    rec.sig = sig;
-    var all = attempts(); if (!all.some(function (x) { return x.id === rec.id; })) all.push(rec);
-    store.set('attempts', all); store.del('cur_' + t);
-    var cr = {}; attemptQs(rec).forEach(function (q) { cr[q.concept] = (cr[q.concept] !== false) && isRight(rec, q); }); recordConcepts(cr, t);
-    touch('Result: ' + D.tests[t].title + ' (' + rec.pct + '%)', '#/result/' + rec.id);
-    if (location.hash === '#/result/' + rec.id) route(); else location.hash = '#/result/' + rec.id;
-  });
-}
-function topicBars(by) {
+var RESULTS = {};
+function topicBars(topics) {
   var box = h('<div></div>');
-  Object.keys(D.topics).filter(function (k) { return by[k]; }).map(function (k) { return [k, by[k][0], by[k][1]]; })
-    .sort(function (a, b) { return a[1] / a[2] - b[1] / b[2]; })
-    .forEach(function (x) {
-      var p = pct(x[1], x[2]), col = p >= 75 ? 'var(--good)' : p >= 50 ? '#c98a00' : 'var(--bad)';
-      box.appendChild(h('<div class="bar"><span>' + esc(D.topics[x[0]].name) + '</span><span class="track" role="img" aria-label="' + p + '%"><i style="width:' + p + '%;background:' + col + '"></i></span><b>' + x[1] + '/' + x[2] + '</b></div>'));
-    });
-  return box;
-}
-function weakAreas(by) {
-  return Object.keys(by).filter(function (k) { return by[k][0] / by[k][1] < 0.6; }).sort(function (a, b) { return by[a][0] / by[a][1] - by[b][0] / by[b][1]; });
-}
-function recommendations(by) {
-  var weak = weakAreas(by), box = h('<div></div>');
-  if (!weak.length) { box.appendChild(h('<p>✓ No weak topic in this attempt (every topic ≥60%). Keep it fresh with the <a href="#/facts">30 high-yield facts</a> and the <a href="#/revision">section checks</a>.</p>')); return box; }
-  box.appendChild(h('<p>Revise these topics first (below 60% in this attempt):</p>'));
-  var ul = h('<ul></ul>');
-  weak.forEach(function (k) {
-    var T = D.topics[k];
-    ul.appendChild(h('<li><b>' + esc(T.name) + '</b> (' + by[k][0] + '/' + by[k][1] + ') — re-read ' + T.sections.map(function (s) { return '<a href="' + secLink(s) + '">' + esc(secTitle(s)) + '</a>'; }).join(' and ') + ', then do its section checks.</li>'));
+  (topics || []).slice().sort(function (a, b) { return a.score - b.score; }).forEach(function (x) {
+    var p = x.score, col = p >= 75 ? 'var(--good)' : p >= 50 ? '#c98a00' : 'var(--bad)';
+    box.appendChild(h('<div class="bar"><span>' + esc(topicName(x.topic)) + '</span><span class="track" role="img" aria-label="' + p + '%"><i style="width:' + p + '%;background:' + col + '"></i></span><b>' + x.questions_correct + '/' + x.questions_attempted + '</b></div>'));
   });
-  box.appendChild(ul);
+  if (!box.children.length) box.appendChild(h('<p class="muted">No results yet.</p>'));
   return box;
+}
+function reviewItemHtml(it) {
+  var el = h('<div class="q"><div class="row small muted"><b style="color:var(--navy)">' + esc(it.code || ('Question ' + it.n)) + '</b><span>· ' + esc(topicName(it.topic)) + '</span>' + (it.difficulty ? '<span>· ' + esc(it.difficulty) + '</span>' : '') + '<span class="pill ' + (it.response == null ? 'warn' : it.correct ? 'good' : 'bad') + '">' + (it.response == null ? 'Unanswered' : it.correct ? 'Correct' : 'Incorrect') + '</span></div><div class="stem md">' + stemParas(it) + '</div><div class="opts"></div><div class="fb ' + (it.correct ? 'good' : 'bad') + ' md"></div></div>');
+  var og = $('.opts', el);
+  it.options.forEach(function (o, i) {
+    var cls = i === it.correctOption ? 'right' : i === it.response ? 'wrong' : '';
+    og.appendChild(h('<div class="opt ' + cls + '"><span class="L">' + LETTERS[i] + '</span><span>' + inl(o) + (i === it.response ? ' <span class="small muted">(your answer)</span>' : '') + '</span></div>'));
+  });
+  var sec = it.section && (SECTIONS[it.section] || SUBS[it.section]) ? it.section : null;
+  $('.fb', el).innerHTML = '<p><span class="mark">Answer: ' + LETTERS[it.correctOption] + '.</span> ' + inl(it.explanation || '') + '</p>' + (it.trap ? '<p><strong>Exam trap:</strong> ' + inl(it.trap) + '</p>' : '') + (it.objective ? '<p class="small"><b>Learning objective:</b> ' + esc(it.objective) + '</p>' : '') + '<p class="src">' + esc(it.ref || '') + (sec ? ' · <a href="' + secLink(sec) + '">Revise section ' + esc(num(sec)) + '</a>' : '') + (it.concept ? ' · <a href="#/practice/concept/' + esc(it.concept) + '">Practise this concept</a>' : '') + '</p>';
+  return el;
 }
 function viewResult(id) {
-  var a = attempts().filter(function (x) { return x.id === id; })[0];
-  if (!a) { app.appendChild(h('<div class="card">Result not found in this browser. <a href="#/results">See all results</a>.</div>')); return; }
-  var T = D.tests[a.test], S = settings();
-  app.appendChild(h('<div class="row"><div><div class="pill">' + esc(T.title) + '</div><h1 style="margin-top:6px">Your result: ' + a.pct + '%</h1><p class="muted" style="margin:0">' + esc(a.name) + (a.studentId ? ' · ID ' + esc(a.studentId) : '') + (a.email ? ' · ' + esc(a.email) : '') + ' · submitted ' + fmtDate(a.submittedAt) + (a.auto ? ' (automatically, time ran out)' : '') + '</p></div><div class="spacer"></div><div class="row noprint"><button class="btn dl">⬇ Download result file</button><button class="btn pr">🖨 Print</button><a class="btn" href="#/test/' + a.test + '">Retake</a>' + (a.correct < a.total ? '<a class="btn primary" href="#/practice/retry/' + a.id + '">🔁 Retry my mistakes</a>' : '') + '</div></div>'));
-  app.appendChild(h('<div class="grid g4" style="margin:16px 0">' +
-    [['Score', a.score + ' / ' + a.total], ['Percentage', a.pct + '%'], ['Correct', a.correct], ['Incorrect', a.incorrect], ['Unanswered', a.unanswered], ['Time used', fmtDur(a.durationSec)], ['Date', fmtDate(a.submittedAt)], ['Band', a.pct >= S.pass ? 'At or above the ' + S.pass + '% mark' : 'Below the ' + S.pass + '% mark']]
-      .map(function (k) { return '<div class="card kpi"><div class="v" style="font-size:' + (String(k[1]).length > 12 ? 15 : 24) + 'px">' + esc(k[1]) + '</div><div class="l">' + esc(k[0]) + '</div></div>'; }).join('') + '</div>'));
-  var pc = h('<div class="card" style="margin-bottom:16px"><h2 style="margin-top:0">🎯 Revision priorities</h2><p class="small muted" style="margin-top:0">Your three weakest topics in this attempt, with the exact sections to review. “Retry weak questions” gives you the questions you missed plus 2–3 new questions on the same concepts.</p></div>');
-  pc.appendChild(priorityCards([a], 3)); app.appendChild(pc);
-  var g = h('<div class="card"><h2 style="margin-top:0">Topic performance</h2></div>');
-  g.appendChild(topicBars(a.byTopic));
-  app.appendChild(g);
-  var rv = h('<div class="card" style="margin-top:16px"><div class="row"><h2 style="margin:0">Review every question</h2><div class="spacer"></div><div class="tabs" style="margin:0;border:0"><button class="on" data-f="all">All</button><button data-f="wrong">Incorrect</button><button data-f="blank">Unanswered</button></div></div><div class="rvl"></div></div>');
-  function fill(f) {
-    $$('.tabs button', rv).forEach(function (b) { b.classList.toggle('on', b.dataset.f === f); });
-    var l = $('.rvl', rv); l.innerHTML = '';
-    attemptQs(a).forEach(function (q, i) {
-      var gv = givenIdx(a, q);
-      if (f === 'wrong' && (gv == null || isRight(a, q))) return;
-      if (f === 'blank' && gv != null) return;
-      var it = h('<div class="review-item"><div class="small muted">Question ' + (i + 1) + '</div></div>'); it.appendChild(reviewItem(q, gv, true)); l.appendChild(it);
-    });
-    if (!l.children.length) l.appendChild(h('<p class="muted">None.</p>'));
-  }
-  $$('.tabs button', rv).forEach(function (b) { b.onclick = function () { fill(b.dataset.f); }; });
-  fill('all'); app.appendChild(rv);
-  $('.dl', app).onclick = function () { exportAttempts([a], 'vulva-result_' + slug(a.name) + '_' + a.test + '_' + new Date(a.submittedAt).toISOString().slice(0, 10) + '.json'); };
-  $('.pr', app).onclick = function () { window.print(); };
-}
-function exportAttempts(list, name) {
-  var bundle = { kind: 'vulva-review-results', app: D.meta.short, version: APP_VERSION, exportedAt: Date.now(), attempts: list };
-  download(name, JSON.stringify(bundle, null, 1));
-  toast('Result file downloaded. Send it to your teacher if asked.');
+  var hold = h('<div class="card">Loading your result…</div>'); app.appendChild(hold);
+  (RESULTS[id] ? Promise.resolve({ ok: true, result: RESULTS[id] }) : CX.api('vulvaResult', { attemptId: id })).then(function (r) {
+    if (!document.body.contains(hold)) return; hold.remove();
+    if (!r.ok) { app.appendChild(h('<div class="card">' + esc(r.error || 'Result not found.') + ' <a href="#/progress">All results</a></div>')); return; }
+    var a = r.result; RESULTS[id] = a;
+    app.appendChild(h('<div class="row"><div><div class="pill">' + esc(a.assessmentTitle) + '</div><h1 style="margin-top:6px">Your result: ' + a.percent + '%</h1><p class="muted" style="margin:0">' + esc(CX.name || '') + ' · submitted ' + fmtDate(a.submittedAt) + (a.auto ? ' (automatically, time ran out)' : '') + '</p></div><div class="spacer"></div><div class="row noprint"><button class="btn pr">🖨 Print</button><a class="btn" href="#/tests">Assessments</a>' + (a.correct < a.total ? '<a class="btn primary" href="#/practice/retry/' + esc(a.id) + '">🔁 Retry my mistakes</a>' : '') + '</div></div>'));
+    var band = a.passPct ? (a.percent >= a.passPct ? 'At or above the ' + a.passPct + '% mark' : 'Below the ' + a.passPct + '% mark') : '';
+    app.appendChild(h('<div class="grid g4" style="margin:16px 0">' +
+      [['Score', a.score + ' / ' + a.total], ['Percentage', a.percent + '%'], ['Correct', a.correct], ['Incorrect', a.incorrect], ['Unanswered', a.unanswered], ['Time used', fmtDur(a.durationSec)], ['Date', fmtDate(a.submittedAt)]].concat(band ? [['Band', band]] : [])
+        .map(function (k) { return '<div class="card kpi"><div class="v" style="font-size:' + (String(k[1]).length > 12 ? 15 : 24) + 'px">' + esc(k[1]) + '</div><div class="l">' + esc(k[0]) + '</div></div>'; }).join('') + '</div>'));
+    var pc = h('<div class="card" style="margin-bottom:16px"><h2 style="margin-top:0">🎯 Revision priorities</h2><p class="small muted" style="margin-top:0">Your weakest topics in this attempt, with the sections to review.</p></div>');
+    pc.appendChild(priorityCards(a.priorities, 3)); app.appendChild(pc);
+    var g = h('<div class="card"><h2 style="margin-top:0">Topic performance</h2></div>'); g.appendChild(topicBars(a.topics)); app.appendChild(g);
+    var rv = h('<div class="card" style="margin-top:16px"><div class="row"><h2 style="margin:0">Review every question</h2><div class="spacer"></div><div class="tabs" style="margin:0;border:0"><button class="on" data-f="all">All</button><button data-f="wrong">Incorrect</button><button data-f="blank">Unanswered</button></div></div><div class="rvl"></div></div>');
+    function fill(f) {
+      $$('.tabs button', rv).forEach(function (b) { b.classList.toggle('on', b.dataset.f === f); });
+      var l = $('.rvl', rv); l.innerHTML = '';
+      if (!a.reviewAvailable) { l.appendChild(h('<p class="muted">' + esc(a.reviewMessage || 'Your teacher has not released the answers for this assessment.') + '</p>')); return; }
+      a.review.forEach(function (it) {
+        if (f === 'wrong' && (it.response == null || it.correct)) return;
+        if (f === 'blank' && it.response != null) return;
+        var w = h('<div class="review-item"><div class="small muted">Question ' + it.n + '</div></div>'); w.appendChild(reviewItemHtml(it)); l.appendChild(w);
+      });
+      if (!l.children.length) l.appendChild(h('<p class="muted">None.</p>'));
+    }
+    $$('.tabs button', rv).forEach(function (b) { b.onclick = function () { fill(b.dataset.f); }; });
+    fill('all'); app.appendChild(rv);
+    $('.pr', app).onclick = function () { window.print(); };
+  });
 }
 function viewProgress(tab) {
   app.appendChild(h('<h1>My Progress</h1>'));
   var tabs = h('<div class="tabs" role="tablist"><button data-f="results">Results</button><button data-f="weak">Weak topics</button><button data-f="queue">Revision queue</button></div>');
-  var body = h('<div></div>'); app.appendChild(tabs); app.appendChild(body);
+  var body = h('<div><p class="muted">Loading…</p></div>'); app.appendChild(tabs); app.appendChild(body);
+  var data = null;
   function show(f) {
     $$('button', tabs).forEach(function (b) { b.classList.toggle('on', b.dataset.f === f); b.setAttribute('aria-selected', b.dataset.f === f); });
     body.innerHTML = '';
-    ({ results: progResults, weak: progWeak, queue: progQueue })[f](body);
+    if (!data) { body.appendChild(h('<p class="muted">Loading…</p>')); return; }
+    ({ results: progResults, weak: progWeak, queue: progQueue })[f](body, data);
   }
   $$('button', tabs).forEach(function (b) { b.onclick = function () { show(b.dataset.f); }; });
-  show(['weak', 'queue'].indexOf(tab) >= 0 ? tab : 'results');
+  var first = ['weak', 'queue'].indexOf(tab) >= 0 ? tab : 'results';
+  show(first);
+  if (CX.role !== 'student') { data = { attempts: [], topics: [], priorities: [], srs: {}, due: [] }; show(first); return; }
+  CX.api('vulvaMyResults').then(function (r) { if (!r.ok) { body.innerHTML = '<p class="err">' + esc(r.error) + '</p>'; return; } data = r; SV.srs = r.srs; SV.priorities = r.priorities; if (document.body.contains(body)) show(first); });
 }
-function progResults(body) {
-  var all = attempts(), P = store.get('profile', {});
-  body.appendChild(h('<p class="muted">Every submitted attempt in this browser' + (P.name ? ' (' + esc(P.name) + (P.studentId ? ', ID ' + esc(P.studentId) : '') + ')' : '') + '. Results are not sent anywhere automatically. Use “Download” to send a file to your teacher.</p>'));
-  var lecKpis2 = D.lectures.map(function (L, i) { var s = lectureProgress(i + 1); return '<div class="card kpi"><div class="v">' + pct(s.done, s.total) + '%</div><div class="l">' + esc(L.title) + ' studied</div></div>'; }).join('');
-  body.appendChild(h('<div class="grid g4" style="margin:4px 0 14px">' + lecKpis2 + '<div class="card kpi"><div class="v">' + all.length + '</div><div class="l">Assessment attempts</div></div><div class="card kpi"><div class="v">' + dueConcepts().length + '</div><div class="l">Concepts due for revision</div></div></div>'));
-  if (!all.length) { body.appendChild(h('<div class="card">No assessments submitted yet. <a href="#/tests">Go to the assessments</a>.</div>')); return; }
-  var tbl = h('<div class="card" style="overflow-x:auto"><div class="row"><h2 style="margin:0">Attempts</h2><div class="spacer"></div><button class="btn dla">⬇ Download all my results</button></div><table class="data" style="margin-top:10px"><thead><tr><th>Assessment</th><th>Date</th><th>Score</th><th>%</th><th>Correct</th><th>Incorrect</th><th>Unanswered</th><th>Time</th><th></th></tr></thead><tbody></tbody></table></div>');
-  all.slice().reverse().forEach(function (a) {
-    $('tbody', tbl).appendChild(h('<tr><td>' + esc(D.tests[a.test].title) + '</td><td>' + fmtDate(a.submittedAt) + '</td><td>' + a.score + '/' + a.total + '</td><td><b>' + a.pct + '%</b></td><td>' + a.correct + '</td><td>' + a.incorrect + '</td><td>' + a.unanswered + '</td><td>' + fmtDur(a.durationSec) + '</td><td><a href="#/result/' + a.id + '">Open</a></td></tr>'));
+function progResults(body, d) {
+  body.appendChild(h('<p class="muted">Every assessment you have submitted, saved on the platform under your account.</p>'));
+  var lecKpis = D.lectures.map(function (L, i) { var s = lectureProgress(i + 1); return '<div class="card kpi"><div class="v">' + pct(s.done, s.total) + '%</div><div class="l">' + esc(L.title) + ' studied</div></div>'; }).join('');
+  body.appendChild(h('<div class="grid g4" style="margin:4px 0 14px">' + lecKpis + '<div class="card kpi"><div class="v">' + d.attempts.length + '</div><div class="l">Assessment attempts</div></div><div class="card kpi"><div class="v">' + (d.due || []).length + '</div><div class="l">Concepts due for revision</div></div></div>'));
+  if (!d.attempts.length) { body.appendChild(h('<div class="card">No assessments submitted yet. <a href="#/tests">Go to the assessments</a>.</div>')); return; }
+  var tbl = h('<div class="card" style="overflow-x:auto"><h2 style="margin:0">Attempts</h2><table class="data" style="margin-top:10px"><thead><tr><th>Assessment</th><th>Date</th><th>Score</th><th>%</th><th>Correct</th><th>Incorrect</th><th>Unanswered</th><th>Time</th><th></th></tr></thead><tbody></tbody></table></div>');
+  d.attempts.forEach(function (a) {
+    $('tbody', tbl).appendChild(h('<tr><td>' + esc(a.assessmentTitle) + (a.auto ? ' <span class="pill warn">auto</span>' : '') + '</td><td>' + fmtDate(a.submittedAt) + '</td><td>' + a.score + '/' + a.total + '</td><td><b>' + a.percent + '%</b></td><td>' + a.correct + '</td><td>' + a.incorrect + '</td><td>' + a.unanswered + '</td><td>' + fmtDur(a.durationSec) + '</td><td><a href="#/result/' + esc(a.id) + '">Open</a></td></tr>'));
   });
-  $('.dla', tbl).onclick = function () { exportAttempts(all, 'vulva-results_' + slug(P.name || 'student') + (P.studentId ? '_' + slug(P.studentId) : '') + '_all.json'); };
   body.appendChild(tbl);
-  var g = h('<div class="card" style="margin-top:16px"><h2 style="margin-top:0">Topic performance</h2><p class="small muted">Combined from your latest attempt at each assessment.</p></div>');
-  g.appendChild(topicBars(combinedByTopic(latestAttempts()))); body.appendChild(g);
+  var g = h('<div class="card" style="margin-top:16px"><h2 style="margin-top:0">Topic performance</h2><p class="small muted">From your latest attempt at each assessment.</p></div>');
+  g.appendChild(topicBars(d.topics)); body.appendChild(g);
 }
-function progWeak(body) {
-  body.appendChild(h('<p class="muted">Revision priorities from your latest attempt at each assessment: topic, score, number missed, and the exact sections to review.</p>'));
-  body.appendChild(priorityCards(latestAttempts(), 5));
-  if (latestAttempts().length) body.appendChild(h('<div class="row" style="margin-top:14px"><a class="btn primary" href="#/practice/retry">🔁 Retry all my mistakes (+ new questions on the same concepts)</a></div>'));
+function progWeak(body, d) {
+  body.appendChild(h('<p class="muted">Revision priorities from your latest attempt at each assessment: topic, score, number missed, and the sections to review.</p>'));
+  body.appendChild(priorityCards(d.priorities, 5));
+  if (d.attempts.length) body.appendChild(h('<div class="row" style="margin-top:14px"><a class="btn primary" href="#/practice/retry">🔁 Retry all my mistakes (+ new questions on the same concepts)</a></div>'));
 }
-function progQueue(body) {
-  var S = srs(), due = dueConcepts(), keys = Object.keys(S).sort(function (a, b) { return S[a].due - S[b].due; });
-  body.appendChild(h('<p class="muted">A simple spaced-revision queue kept in this browser. A concept enters the queue when you miss it (in practice or an assessment) and is due at once. Each correct answer pushes it further back: 1, 3, 7, 14 and then 30 days.</p>'));
+function progQueue(body, d) {
+  var S = d.srs || {}, now = Date.now(), keys = Object.keys(S).sort(function (a, b) { return S[a].due - S[b].due; }), due = keys.filter(function (k) { return S[k].due <= now; });
+  body.appendChild(h('<p class="muted">A spaced-revision queue kept on the platform. A concept enters the queue when you miss it (in practice or an assessment) and is due at once. Each correct answer pushes it further back: 1, 3, 7, 14 and then 30 days.</p>'));
   body.appendChild(h('<div class="row" style="margin:6px 0 14px">' + (due.length ? '<a class="btn primary" href="#/practice/queue">▶ Revise the ' + due.length + ' due concept(s) now</a>' : '<span class="pill good">Nothing due now</span>') + '</div>'));
   if (!keys.length) { body.appendChild(h('<div class="card">Your queue is empty. Concepts you miss are added automatically.</div>')); return; }
   var t = h('<div class="card" style="overflow-x:auto"><table class="data"><thead><tr><th>Concept</th><th>Status</th><th>Times missed</th><th>Last result</th><th></th></tr></thead><tbody></tbody></table></div>');
-  var now = Date.now();
   keys.forEach(function (k) {
-    var e = S[k], d = e.due <= now ? '<span class="pill bad">Due now</span>' : '<span class="pill">Due ' + new Date(e.due).toLocaleDateString(undefined, { day: '2-digit', month: 'short' }) + '</span>';
-    $('tbody', t).appendChild(h('<tr><td><a href="' + conceptLink(k) + '">' + esc(conceptName(k)) + '</a></td><td>' + d + '</td><td>' + (e.wrong || 0) + '</td><td>' + (e.lastOk ? '✓' : '✗') + '</td><td><a href="#/practice/concept/' + k + '">Practise</a></td></tr>'));
+    var e = S[k], dd = e.due <= now ? '<span class="pill bad">Due now</span>' : '<span class="pill">Due ' + new Date(e.due).toLocaleDateString(undefined, { day: '2-digit', month: 'short' }) + '</span>';
+    $('tbody', t).appendChild(h('<tr><td><a href="' + conceptLink(k) + '">' + esc(conceptName(k)) + '</a></td><td>' + dd + '</td><td>' + (e.wrong || 0) + '</td><td>' + (e.lastOk ? '✓' : '✗') + '</td><td><a href="#/practice/concept/' + esc(k) + '">Practise</a></td></tr>'));
   });
   body.appendChild(t);
-  var r = h('<div class="row" style="margin-top:12px"><button class="btn danger" type="button">Clear the revision queue</button></div>');
-  $('button', r).onclick = function () { confirmBox('Clear revision queue', 'This clears the spaced-revision queue in this browser. Results and practice history are kept.', 'Clear', function () { store.set('srs', {}); route(); }, true); };
-  body.appendChild(r);
 }
 
 /* ---------------- LAST-MINUTE REVIEW ---------------- */
@@ -1131,7 +1093,7 @@ function installPictureHandlers() {
   // Everyone: click a picture to enlarge it. (Teachers' picture tools are installed by the editor.)
   document.addEventListener('click', function (e) {
     var t = e.target, fig = t.closest ? t.closest('.fig[data-pic]') : null; if (!fig) return;
-    if (t.tagName === 'IMG' && fig.classList.contains('pic')) { var p = PICS[fig.getAttribute('data-pic')]; if (p) lightbox(p.src, (p.caption || fig.getAttribute('data-desc')) + (p.credit ? ' — ' + p.credit : '')); }
+    if (t.tagName === 'IMG' && fig.classList.contains('pic')) { var p = PICS[fig.getAttribute('data-pic')]; if (p) lightbox(t.src, (p.caption || fig.getAttribute('data-desc')) + (p.credit ? ' — ' + p.credit : '')); }
   });
 }
 function allPicSlots() {
@@ -1144,8 +1106,8 @@ function allPicSlots() {
       });
     });
   });
-  D.questions.forEach(function (q) { if (q.image) add('Assessment questions', q.code + ' (' + D.tests[q.test].title + ')', q.image); });
-  PR.forEach(function (x) { if (x.image) add('Practice questions', 'Practice ' + x.id, x.image); });
+  // Question pictures live in the server question bank; the editor supplies them (teachers only).
+  (HOOKS.questionImages ? HOOKS.questionImages() : []).forEach(function (x) { add(x.group, x.where, x.desc); });
   return out;
 }
 function picStats() { var all = allPicSlots(); return { total: all.length, done: all.filter(function (x) { return PICS[x.key]; }).length, all: all }; }
@@ -1202,7 +1164,7 @@ function lightbox(src, cap) {
 }
 function imagesHtml(s) {
   return (s.images || []).map(function (im, k) {
-    return '<figure class="simg al-' + (im.align || 'right') + '" style="width:' + (im.align === 'full' ? 100 : (im.width || 45)) + '%"><img src="' + esc(im.src) + '" alt="' + esc(im.caption || 'Slide picture') + '" data-k="' + k + '" loading="lazy">' + (im.caption ? '<figcaption>' + inl(im.caption) + '</figcaption>' : '') + '</figure>';
+    return '<figure class="simg al-' + (im.align || 'right') + '" style="width:' + (im.align === 'full' ? 100 : (im.width || 45)) + '%">' + imgTag(im.src, 'alt="' + esc(im.caption || 'Slide picture') + '" data-k="' + k + '"') + (im.caption ? '<figcaption>' + inl(im.caption) + '</figcaption>' : '') + '</figure>';
   }).join('');
 }
 function slideHtml(s) {
@@ -1220,13 +1182,17 @@ function viewFaculty() {
   app.appendChild(h('<p class="muted">For the teaching staff. Students never see this area or its tools.</p>'));
   var g = h('<div class="grid g2"></div>');
   [['#/faculty/content', '✏️', 'Content & publishing', 'Edit Mode, draft status, preview, publish to students (and GitHub), version history and rollback.'],
-    ['#/faculty/questions', '🧩', 'Question banks', 'Add, edit, duplicate, reorder and delete practice questions, section checks and assessment questions.'],
+    ['#/teacher/bank', '🗂', 'Question bank', 'Practice and assessment questions on the server: add, edit (each edit is a new version), duplicate, activate/deactivate, history.'],
+    ['#/teacher/assess', '📝', 'Assessments', 'Create, publish, close and archive assessments; question pool, time, attempts, pass mark, answer release.'],
+    ['#/faculty/questions/checks', '🧩', 'Section checks', 'The Pathology Challenge questions (true/false, fill-in, matching, sorting…) — part of the Learn content.'],
     ['#/faculty/media', '🖼', 'Pictures & media library', 'Upload, replace, reuse and remove pictures; captions, alt text, size and alignment for every picture slot.'],
     ['#/present', '🖥️', 'Presentation mode', 'PowerPoint-style lecture decks from the same content, with speaker notes, reveal-answer questions and a slide editor.'],
-    ['#/teacher', '📊', 'Results & item analysis', 'Import student result files, view results and statistics, item analysis with distractor counts and discrimination index, and Excel (CSV) export.']
+    ['#/teacher/students', '👥', 'Student accounts', 'Create student accounts (Student ID + password), reset passwords, unlock, deactivate.'],
+    ['#/teacher/analytics', '📊', 'Results & item analysis', 'Every attempt, per-topic results, item analysis with distractor counts and discrimination index, and Excel (CSV) export.'],
+    ['#/teacher/import', '⬆', 'Import, audit & account', 'Import the question bank (the module seed file), the audit log, and the teacher password.']
   ].forEach(function (c) { g.appendChild(h('<a class="card step" href="' + c[0] + '"><div class="n">' + c[1] + '</div><div><h2 style="margin:0 0 4px">' + c[2] + '</h2><p class="small">' + c[3] + '</p></div></a>')); });
   app.appendChild(g);
-  app.appendChild(h('<div class="note" style="margin-top:16px"><b>Formative revision and practice — not a secure high-stakes examination system.</b> Practice progress and assessment results stay in each student\'s browser; students send result files to you (Results & item analysis).</div>'));
+  app.appendChild(h('<div class="note" style="margin-top:16px">Students sign in with their own Student ID and password. Questions, answers, grading and results are kept on your Google Apps Script backend; the published content on GitHub Pages is encrypted.</div>'));
 }
 function viewPresentHub() {
   var T = teacherOk();
@@ -1392,12 +1358,12 @@ function runPresentation(n, deck, P, wantEdit) {
     $('.ed-file', ed).onchange = function (e) { addPictures(e.target.files, slides[i].k === 'content' && !slides[i].md ? 'full' : 'right'); e.target.value = ''; };
     $('.ed-undo', ed).onclick = doUndo;
     if (o) $('.ed-reset1', ed).onclick = function () { confirmBox('Reset this slide', 'Put this slide back to its original text? Pictures you added to it are removed.', 'Reset slide', function () { change(function () { slides[i] = JSON.parse(JSON.stringify(o)); }); }, true); };
-    $('.ed-exp', ed).onclick = function () { download('vulva-slides_lecture' + n + '_' + new Date().toISOString().slice(0, 10) + '.json', JSON.stringify({ kind: 'vulva-review-slides', lecture: n, version: APP_VERSION, exportedAt: Date.now(), slides: slides })); toast('Slides file downloaded (pictures included).'); };
+    $('.ed-exp', ed).onclick = function () { download(MOD + '-slides_lecture' + n + '_' + new Date().toISOString().slice(0, 10) + '.json', JSON.stringify({ kind: MOD + '-review-slides', lecture: n, version: APP_VERSION, exportedAt: Date.now(), slides: slides })); toast('Slides file downloaded (pictures included).'); };
     $('.ed-imp', ed).onchange = function (e) {
       var f = e.target.files[0]; e.target.value = ''; if (!f) return;
       var r = new FileReader(); r.onload = function () {
         var j; try { j = JSON.parse(r.result); } catch (x) { toast('That is not a slides file.'); return; }
-        if (!j || j.kind !== 'vulva-review-slides' || !Array.isArray(j.slides) || !j.slides.length) { toast('That is not a slides file for this platform.'); return; }
+        if (!j || j.kind !== MOD + '-review-slides' || !Array.isArray(j.slides) || !j.slides.length) { toast('That is not a slides file for this platform.'); return; }
         var go2 = function () { change(function () { slides = j.slides; i = 0; }); toast('Slides imported (' + j.slides.length + ').'); };
         if (j.lecture !== n) confirmBox('Different lecture', 'This file holds slides for Lecture ' + j.lecture + '. Replace the Lecture ' + n + ' deck with it anyway?', 'Replace', go2, true); else confirmBox('Replace slides', 'Replace this deck with the ' + j.slides.length + ' slides in the file? You can Undo while the presentation is open.', 'Replace', go2);
       }; r.readAsText(f);
@@ -1421,180 +1387,279 @@ function runPresentation(n, deck, P, wantEdit) {
   if (wantEdit) toggleEdit();
 }
 
-/* ---------------- TEACHER PORTAL ---------------- */
-// Teacher rights come from the server session (role "admin"); the server re-checks them on every change.
+/* ---------------- TEACHER PAGES ---------------- */
+// Teacher rights come from the server session; the server re-checks them on every request.
 function teacherOk() { return CX.role === 'admin'; }
-function viewTeacher() {
-  if (!teacherOk()) { requireTeacher(function () {}); app.appendChild(h('<div class="card">The results portal is for teachers.</div>')); return; }
-  app.appendChild(h('<p class="small noprint"><a href="#/faculty">← Faculty tools</a></p><h1>Results & item analysis</h1>'));
-  var tabs = h('<div class="tabs"><button data-t="res" class="on">📊 Results</button><button data-t="item">🔎 Item analysis</button><button data-t="set">⚙️ Settings</button><button data-t="help">❓ Help & deployment</button></div>');
+var routeTok = 0;
+function live(tok) { return tok === routeTok; }
+function api(action, payload, opts) { return CX.api(action, payload || {}, opts); }
+function netMsg(r) { return (r && r.error) || 'The platform could not be reached. Check your connection and try again.'; }
+function viewTeacher(tab) {
+  if (!teacherOk()) { app.appendChild(h('<div class="card">The teacher portal is for teachers. <a href="#/">Home</a></div>')); return; }
+  app.appendChild(h('<p class="small noprint"><a href="#/faculty">← Faculty tools</a></p>'));
+  srvTeacher(tab, routeTok);
+}
+/* ---------------- TEACHER PORTAL (from the connected edition; every action is authorised by the backend) ---------------- */
+var TS = { tab: 'assess', aid: '', scope: 'first', bankQ: '', bankKind: 'all', bankTopic: '' };
+function srvTeacher(tab, tok) {
+  TS.tab = ['assess', 'analytics', 'bank', 'students', 'import', 'audit', 'account'].indexOf(tab) >= 0 ? tab : TS.tab;
+  app.appendChild(h('<div class="row"><h1>Teacher portal</h1><div class="spacer"></div><span class="pill good">● Connected to the platform server</span></div>'));
+  app.appendChild(h('<p class="muted small">Gynecology Pathology module (<code>' + esc(CX.module) + '</code>) of the shared Pathology Teaching Platform backend. Every action here is authorised on the server with your teacher session.</p>'));
+  var T = [['assess', '📝 Assessments'], ['analytics', '📊 Analytics & item analysis'], ['bank', '🗂 Question bank'], ['students', '👥 Students'], ['import', '⬆ Import / migration'], ['audit', '🧾 Audit log'], ['account', '🔑 Account']];
+  var tabs = h('<div class="tabs">' + T.map(function (t) { return '<button data-t="' + t[0] + '"' + (t[0] === TS.tab ? ' class="on"' : '') + '>' + t[1] + '</button>'; }).join('') + '</div>');
   var body = h('<div></div>'); app.appendChild(tabs); app.appendChild(body);
-  var state = { test: Object.keys(D.tests)[0], q: '', sort: 'submittedAt', dir: -1 };
-  function show(t) { $$('button', tabs).forEach(function (b) { b.classList.toggle('on', b.dataset.t === t); }); body.innerHTML = ''; ({ res: tResults, item: tItems, set: tSettings, help: tHelp })[t](body, state); }
-  $$('button', tabs).forEach(function (b) { b.onclick = function () { show(b.dataset.t); }; });
-  show('res');
+  $$('button', tabs).forEach(function (b) { b.onclick = function () { location.hash = '#/teacher/' + b.dataset.t; }; });
+  ({ assess: tAssess, analytics: tAnalytics, bank: tBank, students: tStudents, import: tImport, audit: tAudit, account: tAccount })[TS.tab](body, tok);
 }
-function allResults() {
-  var local = attempts().map(function (a) { return Object.assign({ src: 'This browser' }, a); });
-  var imp = store.get('imported', []), seen = {}, out = [];
-  local.concat(imp).forEach(function (a) { if (!seen[a.id]) { seen[a.id] = 1; out.push(a); } });
-  return out;
+function tLoad(body, action, payload, tok, fn) {
+  body.innerHTML = '<div class="card">⏳ Loading…</div>';
+  return api(action, payload || {}).then(function (r) { if (!live(tok)) return; body.innerHTML = ''; if (!r.ok) { body.appendChild(h('<div class="card err">' + esc(netMsg(r)) + '</div>')); return; } fn(r); });
 }
-function validAttempt(a) {
-  if (!a || typeof a.id !== 'string' || !D.tests[a.test] || typeof a.name !== 'string') return false;
-  if (Array.isArray(a.answers)) return !!normAttempt(a);
-  return Array.isArray(a.qids) && !!a.answers && typeof a.answers === 'object';
+var STATUS_TXT = { draft: 'Draft (hidden from students)', published: 'Published (open)', closed: 'Closed (results visible, no new attempts)', archived: 'Archived (hidden)' };
+function tAssess(body, tok) {
+  tLoad(body, 'vulvaAdminOverview', {}, tok, function (r) {
+    body.appendChild(h('<div class="grid g4" style="margin-bottom:14px"><div class="card kpi"><div class="v">' + r.bank.assess + '</div><div class="l">Assessment questions</div></div><div class="card kpi"><div class="v">' + r.bank.practice + '</div><div class="l">Practice questions</div></div><div class="card kpi"><div class="v">' + r.bank.inactive + '</div><div class="l">Inactive questions</div></div><div class="card kpi"><div class="v">' + r.bank.versions + '</div><div class="l">Question versions stored</div></div></div>'));
+    if (!r.assessments.length) { body.appendChild(h('<div class="card">No assessments yet. Run <a href="#/teacher/import">Import / migration</a> first (it creates the module exam as a draft), or create one.</div>')); }
+    var t = h('<div class="card" style="overflow-x:auto"><div class="row"><h2 style="margin:0">Assessments</h2><div class="spacer"></div><button class="btn primary new" type="button">＋ New assessment</button></div><table class="data" style="margin-top:10px"><thead><tr><th>Assessment</th><th>Status</th><th>Questions</th><th>Minutes</th><th>Attempts allowed</th><th>Review</th><th>Started / finished</th><th></th></tr></thead><tbody></tbody></table></div>');
+    r.assessments.forEach(function (a) {
+      var tr = h('<tr><td><b>' + esc(a.title) + '</b><div class="small muted">' + esc(a.id) + '</div></td><td><span class="pill ' + (a.status === 'published' ? 'good' : a.status === 'draft' ? 'warn' : '') + '">' + esc(a.status) + '</span></td><td>' + a.questionCount + ' of ' + a.pool.length + (a.randomizeQuestions ? ' · shuffled' : '') + '</td><td>' + a.durationMin + '</td><td>' + (a.attemptsAllowed || 'unlimited') + '</td><td>' + esc(a.review.replace('_', ' ')) + '</td><td>' + a.started + ' / ' + a.finished + '</td><td class="row" style="gap:4px"></td></tr>');
+      var cell = tr.lastChild;
+      var btn = function (label, fn, cls) { var b = h('<button class="btn ' + (cls || '') + '" type="button" style="padding:4px 8px;font-size:12px">' + label + '</button>'); b.onclick = fn; cell.appendChild(b); };
+      btn('Edit', function () { editAssessment(a, tok); });
+      if (a.status !== 'published') btn('Publish', function () { setStatus(a, 'published'); }, 'primary');
+      if (a.status === 'published') btn('Close', function () { setStatus(a, 'closed'); });
+      if (a.status !== 'draft' && a.status !== 'archived') btn('Back to draft', function () { setStatus(a, 'draft'); });
+      if (a.status !== 'archived') btn('Archive', function () { setStatus(a, 'archived'); });
+      btn('Analytics', function () { TS.aid = a.id; location.hash = '#/teacher/analytics'; });
+      $('tbody', t).appendChild(tr);
+    });
+    $('.new', t).onclick = function () { editAssessment(null, tok); };
+    body.appendChild(t);
+    body.appendChild(h('<p class="small muted">Only <b>published</b> assessments can be started by students; <b>closed</b> ones stay visible with results. Changes apply to new attempts only — every attempt keeps the exact questions, versions and option order it was given.</p>'));
+    function setStatus(a, st) {
+      var go = function () { api('vulvaAdminSaveAssessment', { assessment: Object.assign({}, a, { status: st }) }).then(function (x) { if (x.ok) { toast('“' + a.title + '” is now ' + st + '.'); route(); } else toast(netMsg(x)); }); };
+      if (st === 'published' || st === 'closed' || st === 'archived') confirmBox('Change status', 'Set “' + a.title + '” to ' + STATUS_TXT[st] + '?', 'Confirm', go); else go();
+    }
+  });
 }
-function importFiles(files, done) {
-  var imp = store.get('imported', []), have = {}, added = 0, bad = 0, tampered = 0, pending = files.length;
-  allResults().forEach(function (a) { have[a.id] = 1; });
-  if (!pending) return done(0, 0, 0);
-  Array.prototype.forEach.call(files, function (f) {
-    var r = new FileReader();
-    r.onload = function () {
-      var list = [];
-      try { var j = JSON.parse(r.result); list = j && j.attempts ? j.attempts : Array.isArray(j) ? j : [j]; } catch (e) { bad++; }
-      var checks = list.map(function (a) {
-        if (!validAttempt(a)) { bad++; return Promise.resolve(); }
-        // The check value covers the answers and score as submitted; the score shown is re-graded with the current key.
-        return sha256(sigPayload(a)).then(function (s) {
-          var n = normAttempt(a), rec = Object.assign({}, n, gradeAttempt(n), { src: 'Imported: ' + f.name, verified: s === a.sig });
-          if (!rec.verified) tampered++;
-          if (!have[a.id]) { have[a.id] = 1; imp.push(rec); added++; }
+function editAssessment(a, tok) {
+  a = a || { id: '', title: '', subtitle: '', lecture: '', durationMin: 30, questionCount: 20, pool: [], randomizeQuestions: false, randomizeOptions: true, status: 'draft', passPct: 50, attemptsAllowed: 0, review: 'after_submit' };
+  var m = modal(a.id ? 'Edit assessment' : 'New assessment', '<div class="grid g2"><div class="field"><label for="ea-t">Title</label><input id="ea-t" value="' + esc(a.title) + '"></div><div class="field"><label for="ea-s">Subtitle</label><input id="ea-s" value="' + esc(a.subtitle || '') + '"></div>' +
+    '<div class="field"><label for="ea-l">Lecture tag (L1, L2, MOCK)</label><input id="ea-l" value="' + esc(a.lecture || '') + '"></div><div class="field"><label for="ea-d">Duration (minutes)</label><input id="ea-d" type="number" min="1" max="300" value="' + a.durationMin + '"></div>' +
+    '<div class="field"><label for="ea-n">Questions per attempt</label><input id="ea-n" type="number" min="1" value="' + a.questionCount + '"></div><div class="field"><label for="ea-a">Attempts allowed (0 = unlimited)</label><input id="ea-a" type="number" min="0" max="20" value="' + (a.attemptsAllowed || 0) + '"></div>' +
+    '<div class="field"><label for="ea-p">Pass mark (%)</label><input id="ea-p" type="number" min="0" max="100" value="' + a.passPct + '"></div><div class="field"><label for="ea-r">Answers & explanations for students</label><select id="ea-r"><option value="after_submit">Right after submission</option><option value="after_close">Only after I close the assessment</option><option value="never">Never (score and topics only)</option></select></div></div>' +
+    '<label class="small"><input type="checkbox" id="ea-rq"' + (a.randomizeQuestions ? ' checked' : '') + '> Randomise question order (per attempt)</label><br><label class="small"><input type="checkbox" id="ea-ro"' + (a.randomizeOptions ? ' checked' : '') + '> Randomise option order (per attempt; scoring maps options back automatically)</label>' +
+    '<div class="field" style="margin-top:10px"><label for="ea-q">Question pool — question codes, one per line or separated by commas. If the pool is larger than “questions per attempt”, each student gets a random sample.</label><textarea id="ea-q" rows="6" style="width:100%;font-family:monospace">' + esc((a.pool || []).join('\n')) + '</textarea></div>',
+    [{ label: 'Cancel' }, { label: 'Save', cls: 'primary', busy: true, onClick: function (bg) {
+      var x = { id: a.id || '', title: $('#ea-t', bg).value, subtitle: $('#ea-s', bg).value, lecture: $('#ea-l', bg).value.trim().toUpperCase(), durationMin: +$('#ea-d', bg).value, questionCount: +$('#ea-n', bg).value, attemptsAllowed: +$('#ea-a', bg).value, passPct: +$('#ea-p', bg).value,
+        review: $('#ea-r', bg).value, randomizeQuestions: $('#ea-rq', bg).checked, randomizeOptions: $('#ea-ro', bg).checked, pool: $('#ea-q', bg).value.split(/[\s,;]+/).filter(Boolean), status: a.status };
+      api('vulvaAdminSaveAssessment', { assessment: x }).then(function (r) { if (r.ok) { m.close(); toast('Saved.'); route(); } else { toast(netMsg(r)); var btns = $$('.modal .btn', document); btns.forEach(function (b) { b.disabled = false; }); } });
+      return false;
+    } }]);
+  $('#ea-r', m.el).value = a.review || 'after_submit';
+}
+function tAnalytics(body, tok) {
+  tLoad(body, 'vulvaAdminOverview', {}, tok, function (ov) {
+    if (!ov.assessments.length) { body.appendChild(h('<div class="card">No assessments yet.</div>')); return; }
+    if (!TS.aid || !ov.assessments.some(function (a) { return a.id === TS.aid; })) TS.aid = ov.assessments[0].id;
+    var ctl = h('<div class="card"><div class="row"><div class="field" style="margin:0"><label for="an-a">Assessment</label><select id="an-a">' + ov.assessments.map(function (a) { return '<option value="' + esc(a.id) + '">' + esc(a.title) + ' (' + esc(a.status) + ')</option>'; }).join('') + '</select></div>' +
+      '<div class="field" style="margin:0"><label for="an-s">Attempts used for statistics</label><select id="an-s"><option value="first">First attempt of each student (recommended)</option><option value="best">Best attempt</option><option value="latest">Latest attempt</option><option value="all">All attempts</option></select></div><div class="spacer"></div>' +
+      '<button class="btn e1" type="button" style="margin-top:22px">⬇ Summary CSV</button><button class="btn e2" type="button" style="margin-top:22px">⬇ Item analysis CSV</button><button class="btn e3" type="button" style="margin-top:22px">⬇ Detailed answers CSV</button></div></div>');
+    body.appendChild(ctl); $('#an-a', ctl).value = TS.aid; $('#an-s', ctl).value = TS.scope;
+    var out = h('<div></div>'); body.appendChild(out);
+    var last = null;
+    function load() {
+      out.innerHTML = '<div class="card">⏳ Calculating on the server…</div>';
+      api('vulvaAdminAnalytics', { assessmentId: TS.aid, scope: TS.scope }).then(function (r) {
+        if (!live(tok)) return; out.innerHTML = '';
+        if (!r.ok) { out.appendChild(h('<div class="card err">' + esc(netMsg(r)) + '</div>')); return; }
+        last = r; var s = r.stats;
+        out.appendChild(h('<div class="grid g4" style="margin:14px 0">' + [['Attempts analysed', s.attempts], ['Students', s.students], ['Average', s.mean == null ? '—' : s.mean + '%'], ['Median', s.median == null ? '—' : s.median + '%'], ['Highest', s.highest == null ? '—' : s.highest + '%'], ['Lowest', s.lowest == null ? '—' : s.lowest + '%'], ['Pass rate (≥' + s.passPct + '%)', s.passRate == null ? '—' : s.passRate + '%'], ['Completion rate', s.completionRate == null ? '—' : s.completionRate + '%'], ['In progress now', s.inProgress], ['Auto-submitted (time)', s.expired]]
+          .map(function (k) { return '<div class="card kpi"><div class="v">' + esc(k[1]) + '</div><div class="l">' + esc(k[0]) + '</div></div>'; }).join('') + '</div>'));
+        if (r.topics.length) {
+          out.appendChild(h('<div class="card" style="overflow-x:auto"><h2 style="margin-top:0">Topic performance (weakest first)</h2><table class="data"><thead><tr><th>Topic</th><th>Average</th><th>Answers</th><th>Correct</th><th>Incorrect</th><th>Unanswered</th></tr></thead><tbody>' +
+            r.topics.map(function (t) { return '<tr><td>' + esc((D.topics[t.topic] || {}).name || t.topic) + '</td><td><b>' + t.score + '%</b>' + (t.weak ? ' <span class="pill bad">weak</span>' : t.score >= 80 ? ' <span class="pill good">strong</span>' : '') + '</td><td>' + t.questions_attempted + '</td><td>' + t.questions_correct + '</td><td>' + t.questions_incorrect + '</td><td>' + t.questions_unanswered + '</td></tr>'; }).join('') + '</tbody></table></div>'));
+        }
+        var it = h('<div class="card" style="margin-top:16px;overflow-x:auto"><h2 style="margin-top:0">Question performance & item analysis</h2><p class="small muted">Options are shown in their <b>original</b> order (A–D as written), even when papers were shuffled. Key in green. <b>DI</b> = discrimination index (top 27% minus bottom 27%, shown with ≥10 attempts): ≥0.3 good · 0.2–0.29 acceptable · &lt;0.2 review · negative = check the key. <b>Dead</b> = distractors chosen by nobody. Click a row for the full question.</p><table class="data"><thead><tr><th>Code</th><th>Topic</th><th>n</th><th>Correct</th><th>Incorrect</th><th>Unans.</th><th>A</th><th>B</th><th>C</th><th>D</th><th>Key</th><th>Difficulty</th><th>DI</th><th>Dead</th></tr></thead><tbody></tbody></table></div>');
+        r.items.forEach(function (x) {
+          var tr = h('<tr class="click" tabindex="0"><td>' + esc(x.code) + (x.version > 1 ? ' <span class="small muted">v' + x.version + '</span>' : '') + '</td><td>' + esc((D.topics[x.topic] || {}).name || x.topic) + '</td><td>' + x.n + '</td><td><b>' + x.pctCorrect + '%</b></td><td>' + x.pctIncorrect + '%</td><td>' + x.pctUnanswered + '%</td>' +
+            x.distPct.map(function (p, j) { return '<td' + (j === x.answer ? ' style="color:var(--good);font-weight:800"' : x.dist[j] === 0 ? ' class="muted"' : '') + '>' + p + '%</td>'; }).join('') + '<td>' + LETTERS[x.answer] + '</td><td>' + x.difficultyIndex.toFixed(2) + '</td><td>' + (x.discrimination == null ? '—' : '<span class="' + (x.discrimination < 0 ? 'neg' : x.discrimination < 0.2 ? 'lowdi' : '') + '">' + x.discrimination.toFixed(2) + '</span>') + '</td><td>' + x.nonFunctioning + '</td></tr>');
+          var open = function () { modal(x.code + ' (version ' + x.version + ')', '<p>' + esc(x.stem) + '</p><ol type="A">' + x.options.map(function (o, j) { return '<li' + (j === x.answer ? ' style="color:var(--good);font-weight:700"' : '') + '>' + esc(o) + ' — ' + x.dist[j] + ' (' + x.distPct[j] + '%)</li>'; }).join('') + '</ol><p class="small">Unanswered: ' + x.unanswered + ' · Concept: ' + esc(conceptName(x.concept)) + '</p>'); };
+          tr.onclick = open; tr.onkeydown = function (e) { if (e.key === 'Enter') open(); };
+          $('tbody', it).appendChild(tr);
         });
+        if (!r.items.length) $('tbody', it).appendChild(h('<tr><td colspan="14" class="muted">No finished attempts yet.</td></tr>'));
+        out.appendChild(it);
+        var st = h('<div class="card" style="margin-top:16px;overflow-x:auto"><h2 style="margin-top:0">Student attempts (' + r.attempts.length + ')</h2><div class="field" style="max-width:320px"><label for="an-q">Search name or Student ID</label><input id="an-q" type="search"></div><table class="data"><thead><tr><th>Student</th><th>Student ID</th><th>Attempt</th><th>Status</th><th>Score</th><th>%</th><th>Submitted</th><th></th></tr></thead><tbody></tbody></table></div>');
+        function rows() {
+          var q = ($('#an-q', st).value || '').toLowerCase(), tb = $('tbody', st); tb.innerHTML = '';
+          r.attempts.filter(function (a) { return !q || (a.name + ' ' + a.username).toLowerCase().indexOf(q) >= 0; }).forEach(function (a) {
+            var tr = h('<tr><td>' + esc(a.name) + '</td><td>' + esc(a.username) + '</td><td>' + a.attemptNo + '</td><td><span class="pill ' + (a.status === 'submitted' ? 'good' : a.status === 'started' ? 'warn' : '') + '">' + esc(a.status) + '</span></td><td>' + (a.score == null ? '—' : a.score + '/' + a.total) + '</td><td>' + (a.percent == null ? '—' : '<b>' + a.percent + '%</b>') + '</td><td>' + (a.submittedAt ? fmtDate(a.submittedAt) : '—') + '</td><td></td></tr>');
+            var c = tr.lastChild;
+            if (a.status === 'submitted' || a.status === 'expired') { var b = h('<button class="btn" type="button" style="padding:3px 8px;font-size:12px">Details</button>'); b.onclick = function () { attemptDetail(a.id); }; c.appendChild(b); }
+            if (a.status === 'started') { var x = h('<button class="btn danger" type="button" style="padding:3px 8px;font-size:12px">Cancel attempt</button>'); x.onclick = function () { confirmBox('Cancel attempt', 'Cancel ' + a.name + '’s attempt in progress? It will be marked “abandoned” and will not be scored.', 'Cancel attempt', function () { api('vulvaAdminAbandon', { attemptId: a.id }).then(function (y) { toast(y.ok ? 'Attempt cancelled.' : netMsg(y)); load(); }); }, true); }; c.appendChild(x); }
+            tb.appendChild(tr);
+          });
+        }
+        $('#an-q', st).oninput = rows; rows(); out.appendChild(st);
       });
-      Promise.all(checks).then(function () { if (--pending === 0) { store.set('imported', imp); done(added, bad, tampered); } });
+    }
+    function attemptDetail(id) {
+      api('vulvaAdminAttempt', { attemptId: id }).then(function (r) {
+        if (!r.ok) return toast(netMsg(r));
+        var a = r.result, m = modal(a.name + ' · ' + a.assessmentTitle, '<p class="small muted">Student ID ' + esc(a.username) + ' · ' + fmtDate(a.submittedAt) + (a.auto ? ' · auto-submitted' : '') + ' · time used ' + fmtDur(a.durationSec) + '</p><p><b>' + a.score + '/' + a.total + ' (' + a.percent + '%)</b> — ' + a.correct + ' correct, ' + a.incorrect + ' incorrect, ' + a.unanswered + ' unanswered.</p><div class="dt"></div>');
+        a.review.forEach(function (it) { var d = h('<div class="review-item"></div>'); d.appendChild(reviewItemHtml(it)); $('.dt', m.el).appendChild(d); });
+      });
+    }
+    $('#an-a', ctl).onchange = function (e) { TS.aid = e.target.value; load(); };
+    $('#an-s', ctl).onchange = function (e) { TS.scope = e.target.value; load(); };
+    $('.e1', ctl).onclick = function () { if (!last) return; var rows = [['Name', 'Student ID', 'Assessment', 'Attempt', 'Status', 'Score', 'Total', 'Percentage', 'Correct', 'Incorrect', 'Unanswered', 'Time used (min)', 'Started', 'Submitted', 'Auto-submitted']];
+      last.attempts.forEach(function (a) { rows.push([a.name, a.username, last.assessment.title, a.attemptNo, a.status, a.score, a.total, a.percent, a.correct, a.incorrect, a.unanswered, a.durationSec == null ? '' : Math.round(a.durationSec / 6) / 10, new Date(a.startedAt).toLocaleString(), a.submittedAt ? new Date(a.submittedAt).toLocaleString() : '', a.auto ? 'yes' : 'no']); });
+      download(MOD + '-' + slug(last.assessment.title) + '-summary.csv', csv(rows), 'text/csv;charset=utf-8'); };
+    $('.e2', ctl).onclick = function () { if (!last) return; var rows = [['Code', 'Version', 'Topic', 'Concept', 'n', '% correct', '% incorrect', '% unanswered', 'A %', 'B %', 'C %', 'D %', 'Key', 'Difficulty index', 'Discrimination index', 'Non-functioning distractors']];
+      last.items.forEach(function (x) { rows.push([x.code, x.version, (D.topics[x.topic] || {}).name || x.topic, conceptName(x.concept), x.n, x.pctCorrect, x.pctIncorrect, x.pctUnanswered, x.distPct[0], x.distPct[1], x.distPct[2], x.distPct[3], LETTERS[x.answer], x.difficultyIndex, x.discrimination == null ? '' : x.discrimination, x.nonFunctioning]); });
+      download(MOD + '-' + slug(last.assessment.title) + '-item-analysis.csv', csv(rows), 'text/csv;charset=utf-8'); };
+    $('.e3', ctl).onclick = function () {
+      api('vulvaAdminAnalytics', { assessmentId: TS.aid, scope: TS.scope, withAnswers: true }).then(function (r) {
+        if (!r.ok) return toast(netMsg(r));
+        var rows = [['Name', 'Student ID', 'Attempt ID', 'Question', 'Version', 'Answer given (original letter)', 'Correct answer', 'Result']];
+        (r.answers || []).forEach(function (a) { a.items.forEach(function (x) { rows.push([a.name, a.username, a.id, x[0], x[1], x[2] == null ? '' : LETTERS[x[2]], LETTERS[x[3]], x[2] == null ? 'unanswered' : x[4] ? 'correct' : 'incorrect']); }); });
+        download(MOD + '-' + slug(r.assessment.title) + '-detailed.csv', csv(rows), 'text/csv;charset=utf-8');
+      });
     };
-    r.onerror = function () { bad++; if (--pending === 0) { store.set('imported', imp); done(added, bad, tampered); } };
-    r.readAsText(f);
+    load();
   });
 }
-function kpis(list, S) {
-  var ps = list.map(function (a) { return a.pct; }), emails = {};
-  list.forEach(function (a) { emails[String(a.studentId || a.email || a.name).toLowerCase()] = 1; });
-  var mean = ps.length ? Math.round(10 * ps.reduce(function (x, y) { return x + y; }, 0) / ps.length) / 10 : 0;
-  return [['Attempts', list.length], ['Students', Object.keys(emails).length], ['Average', ps.length ? mean + '%' : '—'], ['Median', ps.length ? median(ps) + '%' : '—'], ['Highest', ps.length ? Math.max.apply(null, ps) + '%' : '—'], ['Lowest', ps.length ? Math.min.apply(null, ps) + '%' : '—'], ['Pass rate (≥' + S.pass + '%)', ps.length ? pct(ps.filter(function (p) { return p >= S.pass; }).length, ps.length) + '%' : '—']];
-}
-function tResults(body, st) {
-  var S = settings();
-  var ctl = h('<div class="card"><div class="row"><div class="field" style="margin:0"><label for="ft">Assessment</label><select id="ft"><option value="ALL">All assessments</option>' + Object.keys(D.tests).map(function (t) { return '<option value="' + t + '">' + esc(D.tests[t].title) + '</option>'; }).join('') + '</select></div><div class="field" style="margin:0;flex:1;min-width:180px"><label for="fq">Search name, Student ID or email</label><input id="fq" type="search" value="' + esc(st.q) + '"></div><div class="spacer"></div>' +
-    '<label class="btn" style="margin-top:22px">⬆ Import result files<input type="file" accept=".json,application/json" multiple hidden></label><button class="btn ex1" style="margin-top:22px">⬇ Summary CSV</button><button class="btn ex2" style="margin-top:22px">⬇ Detailed CSV</button></div><p class="small muted" style="margin:8px 0 0">Results appear here from this browser and from result files students send you (import as many as you like; duplicates are ignored). CSV files open directly in Excel.</p></div>');
-  body.appendChild(ctl);
-  $('#ft', ctl).value = st.test;
-  var out = h('<div></div>'); body.appendChild(out);
-  function filtered() { var q = st.q.toLowerCase(); return allResults().filter(function (a) { return (st.test === 'ALL' || a.test === st.test) && (!q || (a.name + ' ' + (a.studentId || '') + ' ' + (a.email || '')).toLowerCase().indexOf(q) >= 0); }); }
-  function draw() {
-    out.innerHTML = '';
-    var list = filtered();
-    out.appendChild(h('<div class="grid g4" style="margin:14px 0">' + kpis(list, S).map(function (k) { return '<div class="card kpi"><div class="v">' + esc(k[1]) + '</div><div class="l">' + esc(k[0]) + '</div></div>'; }).join('') + '</div>'));
-    if (!list.length) { out.appendChild(h('<div class="card">No results yet for this filter. Ask students to click “Download result file” after an assessment and send you the file, then import it here.</div>')); return; }
-    var by = {}; list.forEach(function (a) { Object.keys(a.byTopic || {}).forEach(function (k) { by[k] = by[k] || [0, 0]; by[k][0] += a.byTopic[k][0]; by[k][1] += a.byTopic[k][1]; }); });
-    var tp = h('<div class="card"><h2 style="margin-top:0">Class topic performance</h2><p class="small muted">Weakest topics first.</p></div>'); tp.appendChild(topicBars(by)); out.appendChild(tp);
-    var cols = [['name', 'Name'], ['studentId', 'Student ID'], ['email', 'Email'], ['test', 'Assessment'], ['score', 'Score'], ['pct', '%'], ['correct', 'Correct'], ['incorrect', 'Incorrect'], ['unanswered', 'Unanswered'], ['submittedAt', 'Date'], ['src', 'Source']];
-    var t = h('<div class="card" style="margin-top:16px;overflow-x:auto"><h2 style="margin-top:0">Student results (' + list.length + ')</h2><table class="data"><thead><tr>' + cols.map(function (c) { return '<th class="sort" data-k="' + c[0] + '" tabindex="0" aria-sort="' + (st.sort === c[0] ? (st.dir > 0 ? 'ascending' : 'descending') : 'none') + '">' + c[1] + (st.sort === c[0] ? (st.dir > 0 ? ' ▲' : ' ▼') : '') + '</th>'; }).join('') + '<th>Check</th></tr></thead><tbody></tbody></table></div>');
-    list.sort(function (a, b) { var x = a[st.sort] == null ? '' : a[st.sort], y = b[st.sort] == null ? '' : b[st.sort]; if (typeof x === 'string') { x = x.toLowerCase(); y = String(y).toLowerCase(); } return (x > y ? 1 : x < y ? -1 : 0) * st.dir; });
-    list.forEach(function (a) {
-      var tr = h('<tr class="click" tabindex="0"><td>' + esc(a.name) + '</td><td>' + esc(a.studentId || '—') + '</td><td>' + esc(a.email || '') + '</td><td>' + esc(D.tests[a.test] ? D.tests[a.test].title : a.test) + '</td><td>' + a.score + '/' + a.total + '</td><td><b>' + a.pct + '%</b></td><td>' + a.correct + '</td><td>' + a.incorrect + '</td><td>' + a.unanswered + '</td><td>' + fmtDate(a.submittedAt) + '</td><td class="small">' + esc(a.src) + '</td><td>' + (a.verified === false ? '<span class="pill warn" title="The file was edited after it was downloaded">⚠ edited</span>' : '<span class="pill good">✓</span>') + '</td></tr>');
-      tr.onclick = function () { studentDetail(a); }; tr.onkeydown = function (e) { if (e.key === 'Enter') studentDetail(a); };
-      $('tbody', t).appendChild(tr);
-    });
-    $$('th.sort', t).forEach(function (th) { var fn = function () { var k = th.dataset.k; if (st.sort === k) st.dir = -st.dir; else { st.sort = k; st.dir = 1; } draw(); }; th.onclick = fn; th.onkeydown = function (e) { if (e.key === 'Enter') fn(); }; });
-    out.appendChild(t);
-    var imp = store.get('imported', []);
-    if (imp.length) { var cl = h('<div class="row" style="margin-top:12px"><button class="btn danger">Remove all imported results (' + imp.length + ')</button></div>'); $('button', cl).onclick = function () { confirmBox('Remove imported results', 'This removes the ' + imp.length + ' imported result(s) from this browser. The original files are not affected, and results taken in this browser stay.', 'Remove', function () { store.set('imported', []); draw(); }, true); }; out.appendChild(cl); }
-  }
-  $('#ft', ctl).onchange = function (e) { st.test = e.target.value; draw(); };
-  $('#fq', ctl).oninput = function (e) { st.q = e.target.value; draw(); };
-  $('input[type=file]', ctl).onchange = function (e) { importFiles(e.target.files, function (a, b, t) { toast(a + ' result(s) imported' + (b ? ', ' + b + ' file(s)/record(s) not recognised' : '') + (t ? ', ' + t + ' marked as edited' : '') + '.'); e.target.value = ''; draw(); }); };
-  $('.ex1', ctl).onclick = function () {
-    var rows = [['Name', 'Student ID', 'Email', 'Assessment', 'Score', 'Total', 'Percentage', 'Correct', 'Incorrect', 'Unanswered', 'Time used (min)', 'Started', 'Submitted', 'Auto-submitted', 'File check', 'Source']];
-    filtered().forEach(function (a) { rows.push([a.name, a.studentId || '', a.email || '', D.tests[a.test].title, a.score, a.total, a.pct, a.correct, a.incorrect, a.unanswered, Math.round(a.durationSec / 6) / 10, new Date(a.startedAt).toLocaleString(), new Date(a.submittedAt).toLocaleString(), a.auto ? 'yes' : 'no', a.verified === false ? 'edited' : 'ok', a.src]); });
-    download('vulva-results-summary_' + st.test + '.csv', csv(rows), 'text/csv;charset=utf-8');
-  };
-  $('.ex2', ctl).onclick = function () {
-    var rows = [['Name', 'Student ID', 'Email', 'Assessment', 'Submitted', 'Question code', 'Question', 'Topic', 'Concept', 'Answer given', 'Correct answer', 'Result']];
-    filtered().forEach(function (a) { attemptQs(a).forEach(function (q) { var g = givenIdx(a, q); rows.push([a.name, a.studentId || '', a.email || '', D.tests[a.test].title, new Date(a.submittedAt).toLocaleString(), q.code, q.id, D.topics[q.topic].name, conceptName(q.concept), g == null ? '' : g < 0 ? '(option removed)' : LETTERS[g], LETTERS[q.answer], g == null ? 'unanswered' : isRight(a, q) ? 'correct' : 'incorrect']); }); });
-    download('vulva-results-detailed_' + st.test + '.csv', csv(rows), 'text/csv;charset=utf-8');
-  };
-  draw();
-}
-function studentDetail(a) {
-  var html = '<p class="small muted">' + (a.studentId ? 'Student ID ' + esc(a.studentId) + ' · ' : '') + (a.email ? esc(a.email) + ' · ' : '') + esc(D.tests[a.test].title) + ' · ' + fmtDate(a.submittedAt) + (a.auto ? ' · auto-submitted' : '') + ' · time used ' + fmtDur(a.durationSec) + '</p><p><b>' + a.score + '/' + a.total + ' (' + a.pct + '%)</b> — ' + a.correct + ' correct, ' + a.incorrect + ' incorrect, ' + a.unanswered + ' unanswered.</p>' +
-    '<div class="tablewrap"><table class="data"><thead><tr><th>Q</th><th>Topic</th><th>Given</th><th>Key</th><th></th></tr></thead><tbody>' +
-    attemptQs(a).map(function (q) { var g = givenIdx(a, q); return '<tr><td>' + esc(q.code) + '</td><td>' + esc(D.topics[q.topic].name) + '</td><td>' + (g == null ? '—' : g < 0 ? '?' : LETTERS[g]) + '</td><td>' + LETTERS[q.answer] + '</td><td>' + (g == null ? '<span class="pill warn">blank</span>' : isRight(a, q) ? '<span class="pill good">✓</span>' : '<span class="pill bad">✗</span>') + '</td></tr>'; }).join('') + '</tbody></table></div>';
-  modal(a.name, html);
-}
-function itemStats(test, list) {
-  // difficulty (% correct), % incorrect / unanswered, distractor counts, and upper–lower 27% discrimination index (n ≥ 10)
-  // Per question, only the attempts whose paper contained it are counted (questions can be added later).
-  return QBY[test].map(function (q, i) {
-    var took = list.filter(function (a) { return (a.qids || []).indexOf(q.id) >= 0; });
-    var n = took.length, sorted = took.slice().sort(function (a, b) { return b.score - a.score; });
-    var k = Math.max(1, Math.round(n * 0.27)), up = sorted.slice(0, k), lo = sorted.slice(n - k);
-    var dist = q.options.map(function () { return 0; }), blank = 0;
-    took.forEach(function (a) { var g = givenIdx(a, q); if (g == null) blank++; else if (g >= 0) dist[g]++; });
-    var right = dist[q.answer], wrongN = n - right - blank;
-    var di = null;
-    if (n >= 10) { var pu = up.filter(function (a) { return isRight(a, q); }).length / k, pl = lo.filter(function (a) { return isRight(a, q); }).length / k; di = Math.round((pu - pl) * 100) / 100; }
-    var wrong = dist.map(function (c, j) { return [j, c]; }).filter(function (x) { return x[0] !== q.answer && x[1] > 0; }).sort(function (x, y) { return y[1] - x[1]; })[0];
-    return { q: q, i: i, n: n, p: pct(right, n), pw: pct(wrongN, n), pb: pct(blank, n), dist: dist, blank: blank, di: di, wrong: wrong };
+function tBank(body, tok) {
+  tLoad(body, 'vulvaAdminBank', {}, tok, function (r) {
+    var ctl = h('<div class="card"><div class="row"><div class="field" style="margin:0"><label for="bk-k">Type</label><select id="bk-k"><option value="all">All</option><option value="assess">Assessment</option><option value="practice">Practice</option><option value="inactive">Inactive only</option></select></div><div class="field" style="margin:0"><label for="bk-t">Topic</label><select id="bk-t"><option value="">All topics</option>' + Object.keys(D.topics).map(function (k) { return '<option value="' + k + '">' + esc(D.topics[k].name) + '</option>'; }).join('') + '</select></div><div class="field" style="margin:0;flex:1;min-width:180px"><label for="bk-q">Search code or text</label><input id="bk-q" type="search"></div><button class="btn primary nq" type="button" style="margin-top:22px">＋ New question</button></div>' +
+      '<p class="small muted" style="margin:8px 0 0">Editing never overwrites: every change creates a new version; attempts keep the version they were given. Deactivated questions are not used in new attempts or practice.</p></div>');
+    body.appendChild(ctl);
+    $('#bk-k', ctl).value = TS.bankKind; $('#bk-t', ctl).value = TS.bankTopic; $('#bk-q', ctl).value = TS.bankQ;
+    var t = h('<div class="card" style="margin-top:14px;overflow-x:auto"><table class="data"><thead><tr><th>Code</th><th>Type</th><th>Topic</th><th>Question</th><th>Key</th><th>Ver.</th><th>Used</th><th>Active</th><th></th></tr></thead><tbody></tbody></table></div>');
+    body.appendChild(t);
+    function draw() {
+      var tb = $('tbody', t); tb.innerHTML = ''; var q = TS.bankQ.toLowerCase(), n = 0;
+      r.questions.filter(function (x) { return (TS.bankKind === 'all' || (TS.bankKind === 'inactive' ? !x.active : x.kind === TS.bankKind)) && (!TS.bankTopic || x.topic === TS.bankTopic) && (!q || (x.qid + ' ' + x.legacyId + ' ' + x.stem).toLowerCase().indexOf(q) >= 0); }).forEach(function (x) {
+        if (n++ > 300) return;
+        var tr = h('<tr><td><b>' + esc(x.qid) + '</b><div class="small muted">' + esc(x.legacyId) + '</div></td><td>' + (x.kind === 'assess' ? 'Assessment' : 'Practice') + '</td><td>' + esc((D.topics[x.topic] || {}).name || x.topic) + '</td><td class="small">' + esc(String(x.stem).replace(/\[\[IMAGE\]\]/g, '🖼').slice(0, 140)) + '…</td><td>' + LETTERS[x.answer] + '</td><td>' + x.version + '</td><td>' + x.usedInAttempts + '</td><td><label><input type="checkbox"' + (x.active ? ' checked' : '') + ' aria-label="Active"></label></td><td class="row" style="gap:4px"></td></tr>');
+        $('input', tr).onchange = function (e) { api('vulvaAdminSetActive', { qid: x.qid, active: e.target.checked }).then(function (y) { if (y.ok) { x.active = e.target.checked; svAt = 0; if (HOOKS.bankChanged) HOOKS.bankChanged(); toast(x.qid + (x.active ? ' activated.' : ' deactivated.')); } else { toast(netMsg(y)); e.target.checked = !e.target.checked; } }); };
+        var c = tr.lastChild;
+        [['Edit', 'edit'], ['Duplicate', 'duplicate'], ['History', 'history']].forEach(function (b) { var el = h('<button class="btn" type="button" style="padding:3px 8px;font-size:12px">' + b[0] + '</button>'); el.onclick = function () { if (b[1] === 'history') history(x); else editQuestion(x, b[1]); }; c.appendChild(el); });
+        tb.appendChild(tr);
+      });
+      if (!tb.children.length) tb.appendChild(h('<tr><td colspan="9" class="muted">No questions match. Import the bank first (Import / migration).</td></tr>'));
+    }
+    function history(x) {
+      api('vulvaAdminQuestionHistory', { qid: x.qid }).then(function (y) {
+        if (!y.ok) return toast(netMsg(y));
+        modal(x.qid + ' — version history', y.versions.map(function (v) { return '<div class="review-item"><div class="small muted">Version ' + v.version + ' · ' + fmtDate(v.createdAt) + ' · by ' + esc(v.createdBy) + '</div><p>' + esc(String(v.stem).slice(0, 400)) + '</p><ol type="A">' + v.options.map(function (o, j) { return '<li' + (j === v.answer ? ' style="color:var(--good);font-weight:700"' : '') + '>' + esc(o) + '</li>'; }).join('') + '</ol></div>'; }).join(''));
+      });
+    }
+    ['#bk-k', '#bk-t'].forEach(function (s) { $(s, ctl).onchange = function () { TS.bankKind = $('#bk-k', ctl).value; TS.bankTopic = $('#bk-t', ctl).value; draw(); }; });
+    $('#bk-q', ctl).oninput = function (e) { TS.bankQ = e.target.value; draw(); };
+    $('.nq', ctl).onclick = function () { editQuestion(null, 'new'); };
+    draw();
   });
 }
-function tItems(body, st) {
-  if (st.test === 'ALL') st.test = Object.keys(D.tests)[0];
-  var ctl = h('<div class="card"><div class="row"><div class="field" style="margin:0"><label for="it">Assessment</label><select id="it">' + Object.keys(D.tests).map(function (t) { return '<option value="' + t + '">' + esc(D.tests[t].title) + '</option>'; }).join('') + '</select></div><div class="field" style="margin:0"><label for="is">Sort by</label><select id="is"><option value="p">Hardest first (% correct)</option><option value="di">Lowest discrimination first</option><option value="i">Question order</option></select></div><div class="spacer"></div><button class="btn exi" style="margin-top:22px">⬇ Item analysis CSV</button></div>' +
-    '<p class="small muted" style="margin:8px 0 0"><b>% correct</b> = item difficulty. <b>A–D</b> = how many chose each option (key in green). <b>DI</b> = discrimination index: proportion correct in the top 27% of scorers minus the bottom 27% (shown when at least 10 attempts are available; ≥0.3 good, 0.2–0.29 acceptable, &lt;0.2 review the item, negative = check the key). A distractor chosen by no one is not working.</p></div>');
-  body.appendChild(ctl); $('#it', ctl).value = st.test; st.isort = st.isort || 'p'; $('#is', ctl).value = st.isort;
-  var out = h('<div></div>'); body.appendChild(out);
-  function list() { return allResults().filter(function (a) { return a.test === st.test; }); }
-  function draw() {
-    out.innerHTML = '';
-    var L = list();
-    if (!L.length) { out.appendChild(h('<div class="card" style="margin-top:14px">No results for this assessment yet.</div>')); return; }
-    var rows = itemStats(st.test, L), optCols = [];
-    rows.forEach(function (r) { while (optCols.length < r.dist.length) optCols.push(optCols.length); });
-    rows.sort(function (a, b) { return st.isort === 'i' ? a.i - b.i : st.isort === 'di' ? (a.di == null ? 9 : a.di) - (b.di == null ? 9 : b.di) : a.p - b.p; });
-    var t = h('<div class="card" style="margin-top:14px;overflow-x:auto"><h2 style="margin-top:0">Item analysis · ' + L.length + ' attempt(s)' + (L.length < 10 ? ' <span class="pill warn">DI needs ≥10 attempts</span>' : '') + '</h2><table class="data"><thead><tr><th>Code</th><th>Topic</th><th>% correct</th><th>% incorrect</th><th>% unanswered</th>' + optCols.map(function (j) { return '<th>' + LETTERS[j] + '</th>'; }).join('') + '<th>Blank</th><th>Key</th><th>DI</th><th>Top distractor</th></tr></thead><tbody></tbody></table></div>');
-    rows.forEach(function (r) {
-      var diCell = r.di == null ? '—' : '<span class="' + (r.di < 0 ? 'neg' : r.di < 0.2 ? 'lowdi' : '') + '">' + r.di.toFixed(2) + '</span>';
-      var tr = h('<tr class="click" tabindex="0"><td>' + esc(r.q.code) + '</td><td>' + esc(D.topics[r.q.topic].name) + '</td><td><b>' + r.p + '%</b></td><td>' + r.pw + '%</td><td>' + r.pb + '%</td>' + optCols.map(function (j) { var c = r.dist[j]; if (c == null) return '<td class="muted">—</td>'; return '<td' + (j === r.q.answer ? ' style="color:var(--good);font-weight:800"' : c === 0 ? ' class="muted"' : '') + '>' + c + ' <span class="small muted">(' + pct(c, r.n) + '%)</span></td>'; }).join('') + '<td>' + r.blank + '</td><td>' + LETTERS[r.q.answer] + '</td><td>' + diCell + '</td><td>' + (r.wrong ? LETTERS[r.wrong[0]] + ' (' + r.wrong[1] + ')' : '—') + '</td></tr>');
-      var open = function () { var m = modal(r.q.code + ' · ' + D.topics[r.q.topic].name, ''); $('.mbody', m.el).appendChild(reviewItem(r.q, null, false)); var pl = $('.mbody .pill', m.el); if (pl) pl.remove(); };
-      tr.onclick = open; tr.onkeydown = function (e) { if (e.key === 'Enter') open(); };
-      $('tbody', t).appendChild(tr);
-    });
-    out.appendChild(t);
-  }
-  $('#it', ctl).onchange = function (e) { st.test = e.target.value; draw(); };
-  $('#is', ctl).onchange = function (e) { st.isort = e.target.value; draw(); };
-  $('.exi', ctl).onclick = function () {
-    var L = list(); if (!L.length) { toast('No results for this assessment yet.'); return; }
-    var rows = [['Code', 'Question', 'Topic', 'Concept', 'Lecture', 'Section', 'Difficulty level', 'Source type', 'Previous-exam concept', 'Image-based', 'Integrated', 'Key', 'Attempts', '% correct', '% incorrect', '% unanswered', 'A', 'B', 'C', 'D', 'E', 'Blank', 'Discrimination index']];
-    itemStats(st.test, L).forEach(function (r) { var q = r.q; rows.push([q.code, q.id, D.topics[q.topic].name, conceptName(q.concept), q.lecture, q.section, q.difficulty, q.sourceType, q.previousExam ? 'yes' : 'no', q.imageBased ? 'yes' : 'no', q.integrated ? 'yes' : 'no', LETTERS[q.answer], r.n, r.p, r.pw, r.pb, r.dist[0], r.dist[1], r.dist[2], r.dist[3], r.dist[4] == null ? '' : r.dist[4], r.blank, r.di == null ? '' : r.di]); });
-    download('vulva-item-analysis_' + st.test + '.csv', csv(rows), 'text/csv;charset=utf-8');
-  };
-  draw();
+function editQuestion(x, mode) {
+  x = x || { kind: 'assess', lecture: 'MAIN', section: '', sub: '', topic: Object.keys(D.topics)[0], concept: '', objective: '', difficulty: 'Application', priority: 2, label: 'COURSE CORE', previousExam: false, integrated: false, image: '', stem: '', options: ['', '', '', ''], answer: 0, explanation: '', trap: '', ref: '' };
+  var title = mode === 'edit' ? 'Edit ' + x.qid + ' (saves as version ' + (x.version + 1) + ')' : mode === 'duplicate' ? 'Duplicate of ' + x.qid + ' (new question)' : 'New question';
+  var m = modal(title, '<div class="grid g2"><div class="field"><label for="eq-k">Type</label><select id="eq-k"' + (mode === 'edit' ? ' disabled' : '') + '><option value="assess">Assessment (secure)</option><option value="practice">Practice (formative)</option></select></div><div class="field"><label for="eq-l">Lecture</label><select id="eq-l"><option>L1</option><option>L2</option><option>L1+L2</option></select></div>' +
+    '<div class="field"><label for="eq-t">Topic</label><select id="eq-t">' + Object.keys(D.topics).map(function (k) { return '<option value="' + k + '">' + esc(D.topics[k].name) + '</option>'; }).join('') + '</select></div><div class="field"><label for="eq-se">Section / learning block (e.g. 1.3 or 1.3.6)</label><input id="eq-se" value="' + esc(x.sub || x.section) + '"></div>' +
+    '<div class="field"><label for="eq-c">Concept key</label><input id="eq-c" value="' + esc(x.concept) + '" list="eq-cl"><datalist id="eq-cl">' + Object.keys(CONCEPTS).map(function (k) { return '<option value="' + k + '">' + esc(CONCEPTS[k].name) + '</option>'; }).join('') + '</datalist></div><div class="field"><label for="eq-d">Cognitive level</label><select id="eq-d"><option>Recall</option><option>Application</option><option>Interpretation</option></select></div>' +
+    '<div class="field"><label for="eq-p">Priority</label><select id="eq-p"><option value="3">★★★ MUST KNOW</option><option value="2">★★ HIGH-YIELD</option><option value="1">★ SUPPORTING</option></select></div><div class="field"><label for="eq-lb">Source label</label><select id="eq-lb"><option>COURSE + EXAM</option><option>COURSE CORE</option><option>CLARIFICATION</option><option>SUPPLEMENTARY</option></select></div></div>' +
+    '<div class="field"><label for="eq-o">Learning objective</label><input id="eq-o" value="' + esc(x.objective) + '"></div>' +
+    '<div class="field"><label for="eq-s">Stem (blank line = new paragraph; write [[IMAGE]] where the picture goes)</label><textarea id="eq-s" rows="4" style="width:100%">' + esc(x.stem) + '</textarea></div>' +
+    '<div class="field"><label for="eq-i">Picture slot (optional)</label><div class="row"><input id="eq-i" style="flex:1" value="' + esc(x.image || '') + '" placeholder="e.g. pic:vu012">' + (HOOKS.pictureDialog ? '<button class="btn eq-pic" type="button">🖼 Add / edit picture</button>' : '') + '</div><div class="small muted">Pictures are shared slots: the same slot shows the same picture in the lecture, questions and slides.</div></div>' +
+    [0, 1, 2, 3].map(function (i) { return '<div class="row" style="margin:4px 0"><label><input type="radio" name="eq-a" value="' + i + '"' + (x.answer === i ? ' checked' : '') + '> ' + LETTERS[i] + '</label><input class="eq-op" style="flex:1" value="' + esc(x.options[i] || '') + '" aria-label="Option ' + LETTERS[i] + '"></div>'; }).join('') +
+    '<div class="field"><label for="eq-e">Explanation (why the key is right and the main distractor wrong)</label><textarea id="eq-e" rows="3" style="width:100%">' + esc(x.explanation) + '</textarea></div>' +
+    '<div class="grid g2"><div class="field"><label for="eq-tr">Exam trap (optional)</label><input id="eq-tr" value="' + esc(x.trap || '') + '"></div><div class="field"><label for="eq-r">Source / reference</label><input id="eq-r" value="' + esc(x.ref || '') + '"></div></div>' +
+    '<label class="small"><input type="checkbox" id="eq-pe"' + (x.previousExam ? ' checked' : '') + '> Previous-exam concept</label> <label class="small"><input type="checkbox" id="eq-in"' + (x.integrated ? ' checked' : '') + '> Integrated (spans multiple lectures)</label>',
+    [{ label: 'Cancel' }, { label: 'Save', cls: 'primary', onClick: function (bg) {
+      // resolve against the course itself: a learning block → its section; a section → no block
+      var sec = $('#eq-se', bg).value.trim(), isSub = !!SUBS[sec], place = isSub ? SUBS[sec].section : SECTIONS[sec] ? sec : sec;
+      if (!SUBS[sec] && !SECTIONS[sec] && !window.confirm('“' + sec + '” is not a section or learning block of this course. Save anyway?')) return false;
+      var q = { qid: x.qid, kind: $('#eq-k', bg).value, lecture: $('#eq-l', bg).value, topic: $('#eq-t', bg).value, section: place, sub: isSub ? sec : '', concept: $('#eq-c', bg).value.trim(),
+        difficulty: $('#eq-d', bg).value, priority: +$('#eq-p', bg).value, label: $('#eq-lb', bg).value, objective: $('#eq-o', bg).value.trim(), stem: $('#eq-s', bg).value.trim(), image: $('#eq-i', bg).value.trim(),
+        options: $$('.eq-op', bg).map(function (i) { return i.value.trim(); }), answer: +(($('input[name=eq-a]:checked', bg) || {}).value || 0), explanation: $('#eq-e', bg).value.trim(), trap: $('#eq-tr', bg).value.trim(), ref: $('#eq-r', bg).value.trim(),
+        previousExam: $('#eq-pe', bg).checked, integrated: $('#eq-in', bg).checked, code: x.code, legacyId: x.legacyId };
+      api('vulvaAdminSaveQuestion', { question: q, mode: mode }).then(function (r) { if (r.ok) { m.close(); toast(r.unchanged ? 'No changes — nothing saved.' : 'Saved ' + r.qid + ' as version ' + r.version + '.'); if (HOOKS.bankChanged) HOOKS.bankChanged(); refreshServer(true).then(route); } else toast(netMsg(r)); });
+      return false;
+    } }]);
+  if (x.lecture && !$('#eq-l option[value="' + x.lecture + '"]', m.el) && !$$('#eq-l option', m.el).some(function (o) { return o.textContent === x.lecture; })) $('#eq-l', m.el).appendChild(h('<option>' + esc(x.lecture) + '</option>'));
+  var pb = $('.eq-pic', m.el); if (pb) pb.onclick = function () { var inp = $('#eq-i', m.el); if (!inp.value.trim()) inp.value = 'pic:q' + Date.now().toString(36); HOOKS.pictureDialog(inp.value.trim(), { stack: true }); };
+  $('#eq-k', m.el).value = x.kind; $('#eq-l', m.el).value = x.lecture; $('#eq-t', m.el).value = x.topic; $('#eq-d', m.el).value = x.difficulty || 'Application'; $('#eq-p', m.el).value = String(x.priority || 2); $('#eq-lb', m.el).value = x.label || 'COURSE CORE';
+  $('.modal', m.el).style.maxWidth = '860px';
 }
-function tSettings(body) {
-  var S = settings();
-  var c = h('<div class="grid g2"><div class="card"><h2 style="margin-top:0">Assessment settings</h2><div class="field"><label for="sp">Pass mark (%) — used for the pass-rate statistic</label><input id="sp" type="number" min="0" max="100" value="' + S.pass + '"></div>' +
-    Object.keys(D.tests).map(function (t) { return '<div class="field"><label for="sm-' + t + '">Time limit — ' + esc(D.tests[t].title) + ' (minutes)</label><input id="sm-' + t + '" type="number" min="5" max="240" value="' + S.minutes[t] + '"></div>'; }).join('') +
-    '<button class="btn primary sv">Save settings</button><p class="small muted">These settings apply to this browser only. To change the default time limit for every student, use Faculty tools → Content & publishing → Course settings.</p></div>' +
-    '<div class="card"><h2 style="margin-top:0">Passwords</h2><p class="small">The shared student password and the teacher accounts are set on the server (see DEPLOY.md: <code>STUDENT_PASSWORD_HASH</code>, <code>ADMIN_PASSWORD_HASH</code>). Changing one there signs out everyone who used the old one.</p>' +
-    '<h2>Data in this browser</h2><p class="small">' + attempts().length + ' attempt(s) taken here · ' + store.get('imported', []).length + ' imported.</p><button class="btn danger wipe">Delete attempts taken in this browser</button></div></div>');
-  $('.sv', c).onclick = function () {
-    var p = Math.max(0, Math.min(100, +$('#sp', c).value || 50)), m = {};
-    Object.keys(D.tests).forEach(function (t) { m[t] = Math.max(5, Math.min(240, +$('#sm-' + t, c).value || D.tests[t].minutes)); });
-    store.set('settings', { pass: p, minutes: m }); toast('Settings saved.');
+function tStudents(body, tok) {
+  tLoad(body, 'listStudents', {}, tok, function (r) {
+    var c = h('<div class="card"><h2 style="margin-top:0">Student accounts (' + r.students.length + ')</h2><p class="small muted">These are the platform’s own student accounts (shared Students sheet, same sign-in and password rules as the other modules). The username is the Student ID. The server keeps only salted password hashes.</p>' +
+      '<details><summary><b>＋ Add students</b> (paste: Student ID, Full name, Email — one per line)</summary><textarea id="st-b" rows="6" style="width:100%;font-family:monospace" placeholder="2023001, Ahmed Ali, ahmed@example.com"></textarea><button class="btn primary st-add" type="button">Create accounts</button><p class="small muted">Each new student gets a temporary password (shown once) and must choose their own at first sign-in.</p></details>' +
+      '<div class="field" style="max-width:320px;margin-top:10px"><label for="st-q">Search</label><input id="st-q" type="search"></div><div style="overflow-x:auto"><table class="data"><thead><tr><th>Student ID</th><th>Name</th><th>Email</th><th>Status</th><th>Last sign-in</th><th></th></tr></thead><tbody></tbody></table></div></div>');
+    body.appendChild(c);
+    function rows() {
+      var q = ($('#st-q', c).value || '').toLowerCase(), tb = $('tbody', c); tb.innerHTML = '';
+      r.students.filter(function (s) { return !q || (s.username + ' ' + s.name + ' ' + s.email).toLowerCase().indexOf(q) >= 0; }).forEach(function (s) {
+        var tr = h('<tr><td>' + esc(s.username) + '</td><td>' + esc(s.name) + '</td><td>' + esc(s.email) + '</td><td>' + (s.active ? '<span class="pill good">active</span>' : '<span class="pill bad">inactive</span>') + (s.locked ? ' <span class="pill warn">locked</span>' : '') + (s.mustChange ? ' <span class="pill">temp password</span>' : '') + '</td><td>' + (s.lastLogin ? fmtDate(s.lastLogin) : '—') + '</td><td class="row" style="gap:4px"></td></tr>');
+        var cell = tr.lastChild, b = function (l, fn) { var el = h('<button class="btn" type="button" style="padding:3px 8px;font-size:12px">' + l + '</button>'); el.onclick = fn; cell.appendChild(el); };
+        b('Reset password', function () { confirmBox('Reset password', 'Give ' + s.name + ' a new temporary password? They are signed out everywhere.', 'Reset', function () { api('resetStudentPassword', { username: s.username }).then(function (x) { if (x.ok) modal('Temporary password', '<p>' + esc(s.username) + ': <b style="font-family:monospace;font-size:18px">' + esc(x.tempPassword) + '</b></p><p class="small muted">Shown only now.</p>'); else toast(netMsg(x)); }); }); });
+        b(s.active ? 'Deactivate' : 'Activate', function () { api('setStudentActive', { username: s.username, active: !s.active }).then(function (x) { if (x.ok) { s.active = !s.active; rows(); } else toast(netMsg(x)); }); });
+        if (s.locked) b('Unlock', function () { api('unlockStudent', { username: s.username }).then(function (x) { if (x.ok) { s.locked = false; rows(); } else toast(netMsg(x)); }); });
+        tb.appendChild(tr);
+      });
+    }
+    $('#st-q', c).oninput = rows; rows();
+    $('.st-add', c).onclick = function () {
+      var list = $('#st-b', c).value.split(/\r?\n/).map(function (l) { var p = l.split(/[,;\t]/).map(function (x) { return x.trim(); }); return p[0] ? { username: p[0], name: p[1] || '', email: p[2] || '' } : null; }).filter(Boolean);
+      if (!list.length) return toast('Paste at least one line.');
+      api('bulkAddStudents', { students: list }).then(function (x) {
+        if (!x.ok) return toast(netMsg(x));
+        var made = x.results.filter(function (y) { return y.ok; }), bad = x.results.filter(function (y) { return !y.ok; });
+        modal('Accounts created: ' + made.length, (made.length ? '<table class="data"><thead><tr><th>Student ID</th><th>Temporary password</th></tr></thead><tbody>' + made.map(function (y) { return '<tr><td>' + esc(y.username) + '</td><td style="font-family:monospace;font-weight:700">' + esc(y.tempPassword) + '</td></tr>'; }).join('') + '</tbody></table><p class="small muted">Shown only now — copy or download them before closing.</p>' : '') + (bad.length ? '<p class="err">' + bad.map(function (y) { return esc(y.error); }).join('<br>') + '</p>' : ''),
+          [{ label: 'Download CSV', onClick: function () { download(MOD + '-new-student-passwords.csv', csv([['Student ID', 'Temporary password']].concat(made.map(function (y) { return [y.username, y.tempPassword]; }))), 'text/csv;charset=utf-8'); return false; } }, { label: 'Close', cls: 'primary', onClick: function () { route(); } }]);
+      });
+    };
+  });
+}
+function tImport(body, tok) {
+  body.appendChild(h('<div class="card md"><h2 style="margin-top:0">Import / migration of the ' + esc(D.meta.short) + ' question bank</h2><p>Upload <code>' + MOD + '_seed.json</code> (produced by the build from the approved content: the assessed Vulvar Pathology Exam SBAs with answer keys, explanations and metadata, the ungraded practice-bank SBAs, and the assessment definition). The server validates every record first and shows a report; nothing is written until you confirm.</p>' +
+    '<ul><li>Re-importing is safe: unchanged questions are skipped; changed ones become a <b>new version</b> (history kept).</li><li>Assessments are created as <b>drafts</b> only if they do not already exist — your settings are never overwritten.</li><li>Keep this file private: it contains the answer keys. Do not upload it to the student website.</li></ul>' +
+    '<label class="btn primary">📄 Choose ' + MOD + '_seed.json<input type="file" accept=".json,application/json" hidden></label><div class="rep" style="margin-top:14px"></div></div>'));
+  var rep = $('.rep', body), data = null;
+  function showReport(r, dry) {
+    var R = r.report;
+    rep.innerHTML = '<h3>' + (dry ? 'Validation report (nothing written yet)' : 'Import complete') + '</h3><table class="data"><tbody>' +
+      [['Questions found', R.questionsFound], ['New questions ' + (dry ? 'to import' : 'imported'), R.imported], ['Changed questions → new version', R.newVersions], ['Unchanged (skipped)', R.unchanged], ['Rejected', R.rejected], ['Duplicate IDs', R.duplicates], ['Missing metadata (warnings)', R.missingMetadata]].map(function (x) { return '<tr><td>' + x[0] + '</td><td><b>' + x[1] + '</b></td></tr>'; }).join('') + '</tbody></table>' +
+      (R.assessments.length ? '<p><b>Assessments:</b></p><ul>' + R.assessments.map(function (a) { return '<li>' + esc(a.title) + ' — ' + esc(a.action) + ' (' + a.poolFound + '/' + a.pool + ' pool questions found)</li>'; }).join('') + '</ul>' : '') +
+      (R.problems.length ? '<details><summary>' + R.problems.length + ' problem(s)/warning(s)</summary><ul>' + R.problems.map(function (p) { return '<li>' + esc(p.qid || '#' + p.index) + ': ' + esc(p.error || p.warning) + '</li>'; }).join('') + '</ul></details>' : '') +
+      (dry && (R.imported || R.newVersions || R.assessments.some(function (a) { return /created/.test(a.action); })) ? '<button class="btn primary go" type="button">Import now</button>' : '');
+    var go = $('.go', rep); if (go) go.onclick = function () { go.disabled = true; go.textContent = 'Importing…'; api('vulvaAdminImport', Object.assign({}, data, { dryRun: false }), { timeout: 120000 }).then(function (x) { if (x.ok) { showReport(x, false); toast('Import complete.'); if (HOOKS.bankChanged) HOOKS.bankChanged(); refreshServer(true); } else toast(netMsg(x)); }); };
+  }
+  $('input[type=file]', body).onchange = function (e) {
+    var f = e.target.files[0]; if (!f) return; var rd = new FileReader();
+    rd.onload = function () {
+      try { data = JSON.parse(rd.result); if (data.kind !== MOD + '-seed' || !Array.isArray(data.questions)) throw 0; } catch (x) { rep.innerHTML = '<p class="err">This is not a seed file for this module.</p>'; return; }
+      rep.innerHTML = '<p>⏳ Validating ' + data.questions.length + ' questions on the server…</p>';
+      api('vulvaAdminImport', { questions: data.questions, assessments: data.assessments, topics: data.topics, dryRun: true }, { timeout: 120000 }).then(function (r) { data = { questions: data.questions, assessments: data.assessments, topics: data.topics }; if (r.ok) showReport(r, true); else rep.innerHTML = '<p class="err">' + esc(netMsg(r)) + '</p>'; });
+    };
+    rd.readAsText(f);
   };
-  $('.wipe', c).onclick = function () { confirmBox('Delete attempts', 'This permanently deletes the ' + attempts().length + ' attempt(s) taken in this browser. Export a CSV first if you need them. Imported results are kept.', 'Delete', function () { store.set('attempts', []); route(); }, true); };
+}
+function tAudit(body, tok) {
+  tLoad(body, 'vulvaAdminAudit', { limit: 400 }, tok, function (r) {
+    var t = h('<div class="card" style="overflow-x:auto"><h2 style="margin-top:0">Audit log (latest ' + r.events.length + ')</h2><table class="data"><thead><tr><th>When</th><th>Who</th><th>Role</th><th>Event</th><th>Reference</th><th>Detail</th></tr></thead><tbody>' +
+      r.events.map(function (e) { return '<tr><td>' + fmtDate(e.at) + '</td><td>' + esc(e.actor) + '</td><td>' + esc(e.role) + '</td><td>' + esc(e.event) + '</td><td class="small">' + esc(e.ref) + '</td><td class="small">' + esc(String(e.detail).slice(0, 160)) + '</td></tr>'; }).join('') + '</tbody></table></div>');
+    body.appendChild(t);
+  });
+}
+function tAccount(body) {
+  var c = h('<div class="card" style="max-width:520px"><h2 style="margin-top:0">Teacher password</h2><p class="small muted">This module has its own teacher password on the shared backend (like every module). Minimum 8 characters.</p><div class="field"><label for="ac-o">Current password</label><input id="ac-o" type="password" autocomplete="current-password"></div><div class="field"><label for="ac-n">New password</label><input id="ac-n" type="password" autocomplete="new-password"></div><button class="btn primary" type="button">Change password</button></div>');
+  $('button', c).onclick = function () { api('changePassword', { oldPassword: $('#ac-o', c).value, newPassword: $('#ac-n', c).value }).then(function (r) { toast(r.ok ? 'Password changed.' : netMsg(r)); if (r.ok) { $('#ac-o', c).value = ''; $('#ac-n', c).value = ''; } }); };
   body.appendChild(c);
+  body.appendChild(h('<div class="note" style="margin-top:16px"><b>Security model.</b> Answer keys, explanations, unpublished assessments, analytics and question editing are available only through server actions that check a valid teacher session. Students receive papers without answers; the server scores every attempt and enforces the timer. The offline revision edition (separate file) is for revision only and its results are not official.</div>'));
 }
-function tHelp(body) {
-  body.appendChild(h('<div class="card md"><h2 style="margin-top:0">How results reach you</h2>' +
-    '<ol><li>Students sign in with the shared student password and take an assessment. The result is stored in <b>their</b> browser and shown to them with explanations and weak areas.</li><li>They click <b>⬇ Download result file</b> (on the result page) or <b>Download all my results</b> (My Progress) and send the .json file to you.</li><li>You choose <b>⬆ Import result files</b> here, select all the files at once, and export <b>Summary CSV</b> or <b>Detailed CSV</b> for Excel.</li></ol>' +
-    '<div class="co clar"><p><b>Formative revision and practice — not a secure high-stakes examination system.</b> The shared student login keeps the platform private but does not identify individual students; name and Student ID are typed by the student. Result files carry a check value that flags casual editing. Questions are graded by their permanent question id, so editing or reordering questions later does not change how old result files are read.</p></div>' +
-    '<h3>For official examinations</h3><p>Use individual student accounts with server-side delivery and scoring. The server already separates roles and permissions, so individual accounts can be added later without redesigning the platform.</p></div>'));
-}
+
 
 /* ---------------- boot ---------------- */
 reindex();
@@ -1607,14 +1672,16 @@ function startApp() {
     modal: modal, confirmBox: confirmBox, toast: toast, uid: uid, slug: slug, download: download, figCard: figCard, picKey: picKey,
     pics: function () { return PICS; }, allPicSlots: allPicSlots, readImageFile: readImageFile, storeImage: storeImage, lightbox: lightbox,
     sbaCard: sbaCard, renderCheck: renderCheck, LETTERS: LETTERS, TYPE_NAMES: TYPE_NAMES, LABEL_TEXT: LABEL_TEXT, STARS: STARS, badge: badge, stars: stars,
-    index: function () { return { SECTIONS: SECTIONS, SUBS: SUBS, ORDER: ORDER, QID: QID, PID: PID, CHECK_ID: CHECK_ID, QBY: QBY }; },
+    index: function () { return { SECTIONS: SECTIONS, SUBS: SUBS, ORDER: ORDER, PID: PID, CHECK_ID: CHECK_ID, SEC_TOPIC: SEC_TOPIC, PR: PR }; },
+    imgTag: imgTag, stemParas: stemParas, editServerQuestion: editQuestion, topicName: topicName, refreshServer: refreshServer, fmtDate: fmtDate, fmtDur: fmtDur, pct: pct,
     cleanup: function (fn) { cleanup = fn; }, app: function () { return app; }, loadDeck: loadDeck
   });
   window.addEventListener('hashchange', route);
-  route();
+  app.innerHTML = '<div class="card">⏳ Loading your progress…</div>';
+  refreshServer(true).then(route, route);
 }
 if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', startApp); else startApp();
-window.__vulva = { D: D, md: md, buildDeck: buildDeck, gradeAttempt: gradeAttempt };
+window.__vulva = { D: D, md: md, buildDeck: buildDeck, state: function () { return { PR: PR, SV: SV }; } };
 }
 window.VULVA_MAIN = main;
 })();

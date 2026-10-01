@@ -101,7 +101,7 @@ test('publishing needs GitHub settings; with them it commits only encrypted file
   const g = S.call('vulvaAdminContentGet');
   assert.strictEqual(g.draft, null);
   assert.strictEqual(g.live.content.lectures[0].title, 'Lecture one');
-  assert.strictEqual(g.lastPublished.note.commit, r.commit);
+  assert.strictEqual(g.lastPublished.commit, r.commit);
   const h = S.call('vulvaAdminHistory');
   assert.ok(h.local.some(function (x) { return x.kind === 'published' && x.commit === r.commit; }));
   assert.ok(Array.isArray(h.github) && h.github[0].sha === r.commit);
@@ -128,6 +128,32 @@ test('pictures: only encrypted, content-addressed files under content/media; exi
   const again = S.call('vulvaAdminMediaPut', { path: p, base64: b64 });
   assert.ok(again.ok && again.existing);
   assert.strictEqual(S.gh.log.length, commits, 'no second commit for the same picture');
+});
+
+test('pictures: a batch goes into ONE commit and skips files already in the repository', function () {
+  const S = setup(true);
+  const f = function (c, n) { return { path: 'content/media/' + c.repeat(32) + '.png.enc', base64: Buffer.from('enc-' + n + '-'.repeat(40)).toString('base64') }; };
+  const first = S.call('vulvaAdminMediaPut', { files: [f('b', 1)] });
+  assert.ok(first.ok);
+  const before = S.gh.log.length;
+  const r = S.call('vulvaAdminMediaPut', { files: [f('b', 1), f('c', 2), f('d', 3)] });
+  assert.ok(r.ok, JSON.stringify(r));
+  assert.deepStrictEqual(r.existing, [f('b', 1).path]);
+  assert.strictEqual(r.saved.length, 2);
+  assert.strictEqual(S.gh.log.length, before + 1, 'one commit for the batch');
+  assert.strictEqual(S.call('vulvaAdminMediaPut', { files: [f('e', 4), { path: 'README.md', base64: f('e', 4).base64 }] }).code, 'badpath', 'one bad name rejects the whole batch');
+  assert.strictEqual(S.call('vulvaAdminMediaPut', { files: [] }).code, 'badfile');
+});
+
+test('GitHub settings: a sub-module can publish to its own repository; gyncAuthorize never shows the token', function () {
+  const gh = githubMock();
+  const b = createBackend({ files: FILES, fetch: gh.handle, properties: { GITHUB_TOKEN: TOKEN, GITHUB_REPO: 'owner/vulva-site', GITHUB_REPO_VAGINA: 'owner/vagina-site', GITHUB_BRANCH_VAGINA: 'pages' } });
+  assert.strictEqual(b.eval("gyncGhConfig_('vulva').repo"), 'owner/vulva-site');
+  assert.strictEqual(b.eval("gyncGhConfig_('vagina').repo"), 'owner/vagina-site');
+  assert.strictEqual(b.eval("gyncGhConfig_('vagina').branch"), 'pages');
+  assert.strictEqual(b.eval("gyncGhConfig_('vulva').branch"), 'main');
+  const out = b.eval('gyncAuthorize()');
+  assert.ok(out.indexOf(TOKEN) < 0);
 });
 
 test('no response ever contains the GitHub token', function () {
