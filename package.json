@@ -1,0 +1,20 @@
+{
+  "name": "vulvar-pathology-platform",
+  "version": "2.0.0",
+  "private": true,
+  "description": "Private pathology teaching platform: shared student access, teacher editing, draft/preview/publish to GitHub.",
+  "license": "UNLICENSED",
+  "engines": {
+    "node": ">=18.17"
+  },
+  "scripts": {
+    "start": "node server/server.js",
+    "hash-password": "node tools/hash-password.js",
+    "test": "node --test test/api.test.js",
+    "test:e2e": "node --test --test-concurrency=1 test/e2e.test.js",
+    "test:all": "npm test && npm run test:e2e"
+  },
+  "devDependencies": {
+    "playwright-core": "1.56"
+  }
+}
