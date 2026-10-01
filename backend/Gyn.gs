@@ -101,7 +101,7 @@ function gynEnsure_() {
   if (cache.get(key)) return;
   var lock = LockService.getScriptLock(); lock.waitLock(20000);
   try {
-    var ss = SpreadsheetApp.getActiveSpreadsheet();
+    var ss = gynSS_();
     Object.keys(GYN_HEADERS).forEach(function (name) {
       var sh = ss.getSheetByName(name), H = GYN_HEADERS[name];
       if (!sh) { sh = ss.insertSheet(name); }
@@ -111,7 +111,16 @@ function gynEnsure_() {
     cache.put(key, '1', 21600);
   } finally { lock.releaseLock(); }
 }
-function gynSheet_(name) { return SpreadsheetApp.getActiveSpreadsheet().getSheetByName(name); }
+/** The platform spreadsheet: the one this project is bound to, or (for a standalone project) the one named by the
+ *  SHEET_ID script property. Uses Code.gs's getSS_ when present so every file opens the same spreadsheet. */
+function gynSS_() {
+  if (typeof getSS_ === 'function') return getSS_();
+  var ss = SpreadsheetApp.getActiveSpreadsheet(); if (ss) return ss;
+  var id = PropertiesService.getScriptProperties().getProperty('SHEET_ID');
+  if (!id) throw new Error('This Apps Script project is not attached to a Google Sheet. Add the script property SHEET_ID (see SETUP.md).');
+  return SpreadsheetApp.openById(id);
+}
+function gynSheet_(name) { return gynSS_().getSheetByName(name); }
 function gynRowObj_(name, vals, rowIndex) {
   var H = GYN_HEADERS[name], o = { _row: rowIndex }, tc = GYN_TEXT[name] || [];
   H.forEach(function (h, j) {

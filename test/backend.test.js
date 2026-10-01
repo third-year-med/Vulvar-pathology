@@ -156,6 +156,18 @@ test('GitHub settings: a sub-module can publish to its own repository; gyncAutho
   assert.ok(out.indexOf(TOKEN) < 0);
 });
 
+test('a standalone Apps Script project works through the SHEET_ID script property', function () {
+  const gh = githubMock();
+  const bad = createBackend({ files: FILES, fetch: gh.handle, standalone: true, properties: {} });
+  const r0 = bad.doPost({ module: 'vulva', action: 'setup', password: TEACHER_PW });
+  assert.strictEqual(r0.ok, false); assert.match(r0.error, /SHEET_ID/);
+  const b = createBackend({ files: FILES, fetch: gh.handle, standalone: true, properties: { SHEET_ID: 'sheet-123', GITHUB_TOKEN: TOKEN, GITHUB_REPO: 'owner/repo' } });
+  assert.ok(b.doPost({ module: 'vulva', action: 'setup', password: TEACHER_PW }).ok);
+  const t = b.doPost({ module: 'vulva', action: 'login', password: TEACHER_PW });
+  assert.ok(b.doPost({ module: 'vulva', action: 'vulvaAdminContentSave', token: t.token, content: sample(), baseRev: 0 }).ok);
+  assert.ok(b.doPost({ module: 'vulva', action: 'vulvaAdminOverview', token: t.token }).ok);
+});
+
 test('no response ever contains the GitHub token', function () {
   const S = setup(true);
   S.call('vulvaAdminContentSave', { content: sample(), baseRev: 0 });
