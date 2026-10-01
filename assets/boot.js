@@ -200,6 +200,7 @@
   function start(sess, keyB64) {
     var admin = sess.role === 'admin';
     if (!keyB64) return fatal(admin ? 'The content key for this module is missing on the platform (CONTENT_KEYS in Code.gs). See SETUP.md, step 3.' : 'The course is not available yet. Please contact your teacher.');
+    if (!/^[A-Za-z0-9+/]{43}=$/.test(keyB64)) return fatal(admin ? 'The content key for this module on the platform is not a real key yet (CONTENT_KEYS in Code.gs still holds a placeholder). See SETUP.md, step 2.' : 'The course is not available yet. Please contact your teacher.');
     var cx = makeCrypto(keyB64);
     var view = admin ? (ss(VIEW_KEY) || 'draft') : 'live';
     screen('<p class="boot-muted">⏳ Opening the course…</p>');
