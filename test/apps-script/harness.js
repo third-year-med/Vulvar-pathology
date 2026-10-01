@@ -78,7 +78,7 @@ function createBackend(opts) {
     console: { log: function () {}, error: function () { if (opts.verbose) console.error.apply(console, arguments); }, warn: function () {} },
     Logger: { log: function () {} },
     JSON: JSON, Math: Math, Date: Date, Object: Object, Array: Array, String: String, Number: Number, RegExp: RegExp, Error: Error, parseInt: parseInt, isNaN: isNaN,
-    SpreadsheetApp: { getActiveSpreadsheet: function () { return ss; }, flush: function () {} },
+    SpreadsheetApp: { getActiveSpreadsheet: function () { return opts.standalone ? null : ss; }, openById: function (id) { if (id !== (opts.properties || {}).SHEET_ID) throw new Error('No spreadsheet with id ' + id); return ss; }, flush: function () {} },
     CacheService: { getScriptCache: function () { return {
       get: function (k) { return cache.has(k) ? cache.get(k) : null; },
       put: function (k, v) { cache.set(k, String(v)); },

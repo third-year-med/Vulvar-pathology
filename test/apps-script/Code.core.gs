@@ -118,7 +118,13 @@ function jsonOut_(obj) {
   return ContentService.createTextOutput(JSON.stringify(obj)).setMimeType(ContentService.MimeType.JSON);
 }
 
-function getSS_() { return SpreadsheetApp.getActiveSpreadsheet(); }
+// (platform edit for standalone projects: fall back to the SHEET_ID script property)
+function getSS_() {
+  var ss = SpreadsheetApp.getActiveSpreadsheet(); if (ss) return ss;
+  var id = PropertiesService.getScriptProperties().getProperty('SHEET_ID');
+  if (!id) throw new Error('This Apps Script project is not attached to a Google Sheet. Add the script property SHEET_ID (see SETUP.md).');
+  return SpreadsheetApp.openById(id);
+}
 
 function ensureSheets_() {
   var cache = CacheService.getScriptCache();

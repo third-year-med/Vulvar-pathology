@@ -28,6 +28,23 @@ You need to do steps 1–5 once. Each takes a few minutes.
    ([`backend/Gyn.gs`](backend/Gyn.gs) is your Gyn.gs with exactly this change, if you prefer to paste the whole file.)
 4. Save.
 
+## 1b. Only if your Apps Script project is NOT attached to a Google Sheet
+
+If the platform answers *"Cannot read properties of null (reading 'getSheetByName')"* or mentions **SHEET_ID**, the project is a standalone script (it was created at script.google.com rather than from a Sheet's **Extensions → Apps Script**). Give it a spreadsheet:
+
+1. Create (or open) the Google Sheet that should hold the platform's data. Copy its ID from the address bar — the part between `/d/` and `/edit`.
+2. Apps Script → **Project Settings (⚙) → Script properties → Add script property**: `SHEET_ID` = that ID.
+3. In **Code.gs**, replace the line `function getSS_() { return SpreadsheetApp.getActiveSpreadsheet(); }` with:
+   ```js
+   function getSS_() {
+     var ss = SpreadsheetApp.getActiveSpreadsheet(); if (ss) return ss;
+     var id = PropertiesService.getScriptProperties().getProperty('SHEET_ID');
+     if (!id) throw new Error('This Apps Script project is not attached to a Google Sheet. Add the script property SHEET_ID (see SETUP.md).');
+     return SpreadsheetApp.openById(id);
+   }
+   ```
+4. Use the current `backend/Gyn.gs` and `backend/GynContent.gs` (they open the same spreadsheet through `getSS_`). Deploy a new version.
+
 ## 2. Check Code.gs
 
 In Code.gs, check two settings:

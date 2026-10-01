@@ -53,7 +53,7 @@ function gynContentAdmin_(module, p, now) {
 
 /* ---------------- storage ---------------- */
 function gyncSheet_() {
-  var ss = SpreadsheetApp.getActiveSpreadsheet(), sh = ss.getSheetByName(GYNC_SHEET);
+  var ss = gynSS_(), sh = ss.getSheetByName(GYNC_SHEET);
   if (!sh) { sh = ss.insertSheet(GYNC_SHEET); }
   if (sh.getLastRow() === 0) { sh.appendRow(GYNC_HEADERS); sh.setFrozenRows(1); }
   return sh;
